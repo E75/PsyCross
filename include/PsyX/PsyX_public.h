@@ -79,6 +79,13 @@ extern void PsyX_SetCursorPosition(int x, int y);
 /* Sets mouse relative movement */
 extern void PsyX_SetCursorRelative(int enable);
 
+/* Snow layer on up-facing 3D surfaces: amount 0..1, viewToWorld = 3x3 camera matrix (rows of the view matrix, 1.0 = unit),
+   camPos = camera position in world units */
+extern void PsyX_SetSnow(float amount, const float* viewToWorld, const float* camPos);
+
+/* Distance fog on opaque 3D geometry: amount 0..1 (1 = about 8 cells of visibility), color = rgb 0..1 */
+extern void PsyX_SetFog(float amount, const float* color);
+
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
 

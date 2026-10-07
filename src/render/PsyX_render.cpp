@@ -76,6 +76,14 @@ int g_windowHeight = 0;
 int g_dbg_wireframeMode = 0;
 int g_dbg_texturelessMode = 0;
 
+// snow layer, see gpu_shader_snow
+static float g_snowAmount = 0.0f;
+static float g_snowViewToWorld[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+static float g_snowCamPos[3] = { 0, 0, 0 };
+static int g_snowSerial = 1;
+static float g_fogAmount = 0.0f;
+static float g_fogColor[3] = { 0.7f, 0.7f, 0.7f };
+
 int g_cfg_pgxpTextureCorrection = 1;
 int g_cfg_pgxpZBuffer = 1;
 int g_cfg_bilinearFiltering = 0;
@@ -495,7 +503,13 @@ typedef struct
 	GLint texelSizeLoc;
 	GLint texLoc;
 	GLint lutLoc;
+	GLint snowLoc;
+	GLint snowViewToWorldLoc;
+	GLint snowCamPosLoc;
+	GLint fogLoc;
+	GLint fogColorLoc;
 #endif
+	int snowSerial;		// last g_snowSerial uploaded to this program
 } PSXGPU_Shader;
 
 PSXGPU_Shader g_gpu_shader_4;
@@ -566,7 +580,7 @@ GLint u_texelSizeLoc;
 		"		+3.0,  -1.0,  +2.0,  -2.0) / 255.0;\n"\
 		"	vec4 dither(vec4 color) {\n"\
 		"		ivec2 dc = ivec2(fract(gl_FragCoord.xy / 4.0) * 4.0);\n"\
-		"		color.xyz += vec3(c_dither[dc.x][dc.y] * v_texcoord.w);\n"\
+		"		color.xyz += vec3(c_dither[dc.x][dc.y] * mod(v_texcoord.w, 2.0));\n"\
 		"		return color;\n"\
 		"	}\n"
 
@@ -618,15 +632,84 @@ GLint u_texelSizeLoc;
 	"	uniform int bilinearFilter;\n"\
 	"	void main() {\n"\
 	"		vec4 color = (bilinearFilter > 0) ? bilinearTextureSample(v_texcoord.xy) : nearestTextureSample(v_texcoord.xy);\n"\
-	"		fragColor = dither(color * v_color);\n"\
+	"		fragColor = dither(applyFog(applySnow(color) * v_color));\n"\
 	"	}\n"
-	
+
 static const char* gpu_shader_common = R"(
 	varying vec4 v_texcoord;
 	varying vec4 v_color;
 	varying vec4 v_page_clut;
 	varying float v_z;
+	varying vec4 v_view;	// xyz = view space position / 128, w = 1 for 3D (PGXP) geometry
 )";
+
+#if USE_PGXP && (defined(RENDERER_OGL) || (OGLES_VERSION == 3))
+// Snow on every surface that faces up. The face normal comes from screen space derivatives of the view space
+// position, then it is rotated to world space with the camera matrix (checked on screen: up is +y there).
+// The noise is in world space so the snow stays put when the camera moves.
+static const char* gpu_shader_snow = R"(
+	uniform float u_snow;
+	uniform mat3 u_viewToWorld;
+	uniform vec3 u_camPos;
+
+	float snowHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+	float snowNoise(vec2 p) {
+		vec2 i = floor(p);
+		vec2 f = fract(p);
+		f = f * f * (3.0 - 2.0 * f);
+		return mix(mix(snowHash(i), snowHash(i + vec2(1.0, 0.0)), f.x),
+				   mix(snowHash(i + vec2(0.0, 1.0)), snowHash(i + vec2(1.0, 1.0)), f.x), f.y);
+	}
+
+	vec4 applySnow(vec4 color) {
+		vec3 p = v_view.xyz * 128.0;
+		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
+		float len = length(n);
+
+		if (u_snow <= 0.0 || v_view.w < 0.5 || v_view.w > 1.5 || len < 0.0001)	// w = 2: car polygon, no snow
+			return color;
+
+		n /= len;
+		if (dot(n, p) > 0.0)
+			n = -n;		// face the camera
+
+		float up = (u_viewToWorld * n).y;
+		vec3 w = u_viewToWorld * p + u_camPos;
+
+		float flatness = smoothstep(0.45, 0.8, up);
+		float patches = snowNoise(w.xz / 400.0) * 0.6 + snowNoise(w.xz / 70.0) * 0.4;
+		float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+
+		// dark texels (cracks, gaps) hold less snow
+		float cover = flatness * u_snow * 1.5 * mix(0.75, 1.0, smoothstep(0.1, 0.5, lum));
+		float snow = smoothstep(patches * 0.7, patches * 0.7 + 0.2, cover);
+
+		vec3 snowCol = vec3(0.92, 0.95, 1.0) * (0.9 + 0.1 * patches);
+		snowCol = mix(snowCol * 0.82, snowCol, smoothstep(0.4, 1.0, snow));	// thin edges are greyer
+
+		color.rgb = mix(color.rgb, snowCol, snow);
+		return color;
+	}
+
+	// applied after the vertex lighting. Falls off with the square of the distance so the near street stays clear.
+	uniform float u_fog;
+	uniform vec3 u_fogColor;
+
+	vec4 applyFog(vec4 color) {
+		float d = length(v_view.xyz) * 128.0;
+		float k = d * u_fog * 0.000108;
+		float f = v_view.w > 0.5 ? 1.0 - exp(-k * k) : 0.0;
+		color.rgb = mix(color.rgb, u_fogColor, f);
+		return color;
+	}
+)";
+#else
+static const char* gpu_shader_snow = R"(
+	vec4 applySnow(vec4 color) { return color; }
+	vec4 applyFog(vec4 color) { return color; }
+)";
+#endif
 
 const char* gpu_shader_4 = GPU_FRAGMENT_SAMPLE_SHADER(4);
 const char* gpu_shader_8 = GPU_FRAGMENT_SAMPLE_SHADER(8);
@@ -637,7 +720,7 @@ const char* gpu_shader_32_rgba =
 	"	void main() {\n"\
 	"		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"\
 	"		vec4 color = texture2D(s_texture, tc);\n"\
-	"		fragColor = dither(color * v_color);\n"\
+	"		fragColor = dither(applyFog(applySnow(color) * v_color));\n"\
 	"	}\n";
 
 #if USE_PGXP
@@ -649,10 +732,12 @@ const char* gpu_shader_32_rgba =
 		"		vec4(a_zw.z, -a_zw.w,  0.0,  1.0));\n"\
 		"	vec2 geom_ofs = vec2(0.5, 0.5);\n"\
 		"	vec4 fragPosition = (a_zw.y > 100.0 ? ofsMat * (Projection3D * vec4((a_position.xy + geom_ofs) * vec2(1.0,-1.0) * a_zw.y, a_zw.x, 1.0)) : (Projection * vec4(a_position.xy, 0.5, 1.0)));\n" \
-		"	gl_Position = fragPosition;\n"
+		"	gl_Position = fragPosition;\n"\
+		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, a_texcoord.w > 1.5 ? 2.0 : 1.0) : vec4(0.0);\n"
 #else
 #	define GTE_PERSPECTIVE_CORRECTION \
-		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"
+		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"\
+		"	v_view = vec4(0.0);\n"
 #endif
 
 #define GTE_VERTEX_SHADER \
@@ -795,6 +880,7 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 		extra_fs_defines,
 		gpu_shader_common,
 		GPU_DITHERING,
+		gpu_shader_snow,
 		source
 	};
 
@@ -812,7 +898,7 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 	const char** vs_list = isPsxShader ? vs_list_psx : vs_list_src;
 	const char** fs_list = isPsxShader ? fs_list_psx : fs_list_src;
 	const int vs_list_cnt = isPsxShader ? 4 : 3;
-	const int fs_list_cnt = isPsxShader ? 5 : 3;
+	const int fs_list_cnt = isPsxShader ? 6 : 3;
 
 	GLuint program = glCreateProgram();
 
@@ -926,6 +1012,12 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->texelSizeLoc = glGetUniformLocation(sh->shader, "texelSize");
 	sh->texLoc = glGetUniformLocation(sh->shader, "s_texture");
 	sh->lutLoc = glGetUniformLocation(sh->shader, "s_rgLut");
+	sh->snowLoc = glGetUniformLocation(sh->shader, "u_snow");
+	sh->snowViewToWorldLoc = glGetUniformLocation(sh->shader, "u_viewToWorld");
+	sh->snowCamPosLoc = glGetUniformLocation(sh->shader, "u_camPos");
+	sh->fogLoc = glGetUniformLocation(sh->shader, "u_fog");
+	sh->fogColorLoc = glGetUniformLocation(sh->shader, "u_fogColor");
+	sh->snowSerial = 0;
 #if USE_PGXP
 	sh->projection3DLoc = glGetUniformLocation(sh->shader, "Projection3D");
 #endif
@@ -1234,6 +1326,44 @@ void GR_SetShader(const ShaderID shader)
 }
 
 
+void PsyX_SetSnow(float amount, const float* viewToWorld, const float* camPos)
+{
+	g_snowAmount = amount;
+	memcpy(g_snowViewToWorld, viewToWorld, sizeof(g_snowViewToWorld));
+	memcpy(g_snowCamPos, camPos, sizeof(g_snowCamPos));
+	g_snowSerial++;
+}
+
+void PsyX_SetFog(float amount, const float* color)
+{
+	g_fogAmount = amount;
+	memcpy(g_fogColor, color, sizeof(g_fogColor));
+	g_snowSerial++;
+}
+
+// uniforms belong to a program, so every program has to get the current weather state once after it changed
+static void GR_UploadSnow(PSXGPU_Shader* sh)
+{
+#if USE_OPENGL
+	// blended primitives (glows, shadows) would turn into grey patches, so fog is only for opaque ones
+	if (sh->fogLoc != -1)
+		glUniform1f(sh->fogLoc, g_PreviousBlendMode == BM_NONE ? g_fogAmount : 0.0f);
+
+	if (sh->snowSerial == g_snowSerial)
+		return;
+
+	sh->snowSerial = g_snowSerial;
+
+	if (sh->snowLoc == -1)
+		return;
+
+	glUniform1f(sh->snowLoc, g_snowAmount);
+	glUniformMatrix3fv(sh->snowViewToWorldLoc, 1, GL_FALSE, g_snowViewToWorld);
+	glUniform3fv(sh->snowCamPosLoc, 1, g_snowCamPos);
+	glUniform3fv(sh->fogColorLoc, 1, g_fogColor);
+#endif
+}
+
 void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
 	GLint texLoc = 0;
@@ -1243,6 +1373,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 	{
 	case TF_4_BIT:
 		GR_SetShader(g_gpu_shader_4.shader);
+		GR_UploadSnow(&g_gpu_shader_4);
 		bilinearFilterLoc = g_gpu_shader_4.bilinearFilterLoc;
 		u_projectionLoc = g_gpu_shader_4.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_4.projection3DLoc;
@@ -1252,6 +1383,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		break;
 	case TF_8_BIT:
 		GR_SetShader(g_gpu_shader_8.shader);
+		GR_UploadSnow(&g_gpu_shader_8);
 		bilinearFilterLoc = g_gpu_shader_8.bilinearFilterLoc;
 		u_projectionLoc = g_gpu_shader_8.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_8.projection3DLoc;
@@ -1261,6 +1393,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		break;
 	case TF_16_BIT:
 		GR_SetShader(g_gpu_shader_16.shader);
+		GR_UploadSnow(&g_gpu_shader_16);
 		bilinearFilterLoc = g_gpu_shader_16.bilinearFilterLoc;
 		u_projectionLoc = g_gpu_shader_16.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_16.projection3DLoc;
@@ -1270,6 +1403,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		break;
 	case TF_32_BIT_RGBA:
 		GR_SetShader(g_gpu_shader_32_rgba.shader);
+		GR_UploadSnow(&g_gpu_shader_32_rgba);
 		bilinearFilterLoc = -1;
 		u_projectionLoc = g_gpu_shader_32_rgba.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_32_rgba.projection3DLoc;

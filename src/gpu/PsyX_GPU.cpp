@@ -305,6 +305,13 @@ void MakeTexcoordQuad(GrVertex* vertex, unsigned char* uv0, unsigned char* uv1, 
 
 	const unsigned char bright = 2;
 
+	// tpage bit 15 = game flag "no weather snow" (cars), carried in bit 1 of dither
+	if (page < 0)
+	{
+		dither |= 2;
+		page &= 0x7FFF;
+	}
+
 	vertex[0].u = uv0[0];
 	vertex[0].v = uv0[1];
 	vertex[0].bright = bright;
@@ -356,6 +363,12 @@ void MakeTexcoordTriangle(GrVertex* vertex, unsigned char* uv0, unsigned char* u
 	assert(uv2);
 
 	const unsigned char bright = 2;
+
+	if (page < 0)
+	{
+		dither |= 2;
+		page &= 0x7FFF;
+	}
 
 	vertex[0].u = uv0[0];
 	vertex[0].v = uv0[1];
@@ -731,6 +744,9 @@ void DrawSplit(const GPUDrawSplit& split)
 
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
+	// blend mode first: the shader setup depends on it (fog is skipped for blended primitives)
+	GR_SetBlendMode(split.blendMode);
+
 	GR_SetTexture(split.textureId, split.texFormat);
 
 	if (split.texFormat == TF_32_BIT_RGBA)
@@ -739,8 +755,6 @@ void DrawSplit(const GPUDrawSplit& split)
 	const bool drawOnScreen = split.drawenv.dfe;
 	GR_SetupClipMode(&split.drawenv.clip, drawOnScreen);
 	GR_SetOffscreenState(&split.drawenv.clip, !drawOnScreen);
-
-	GR_SetBlendMode(split.blendMode);
 
 	GR_DrawTriangles(split.startVertex, split.numVerts / 3);
 
