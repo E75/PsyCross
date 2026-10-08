@@ -305,11 +305,17 @@ void MakeTexcoordQuad(GrVertex* vertex, unsigned char* uv0, unsigned char* uv1, 
 
 	const unsigned char bright = 2;
 
-	// tpage bit 15 = game flag "no weather snow" (cars), carried in bit 1 of dither
+	// tpage bit 15 = game flag "no weather snow" (bit 1 of dither), bit 14 = "snow on very flat faces only" (bit 2)
 	if (page < 0)
 	{
 		dither |= 2;
 		page &= 0x7FFF;
+	}
+
+	if (page & 0x4000)
+	{
+		dither |= 4;
+		page &= 0x3FFF;
 	}
 
 	vertex[0].u = uv0[0];
@@ -368,6 +374,12 @@ void MakeTexcoordTriangle(GrVertex* vertex, unsigned char* uv0, unsigned char* u
 	{
 		dither |= 2;
 		page &= 0x7FFF;
+	}
+
+	if (page & 0x4000)
+	{
+		dither |= 4;
+		page &= 0x3FFF;
 	}
 
 	vertex[0].u = uv0[0];

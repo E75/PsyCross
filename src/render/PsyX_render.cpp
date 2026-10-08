@@ -667,7 +667,7 @@ static const char* gpu_shader_snow = R"(
 		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
 		float len = length(n);
 
-		if (u_snow <= 0.0 || v_view.w < 0.5 || v_view.w > 1.5 || len < 0.0001)	// w = 2: car polygon, no snow
+		if (u_snow <= 0.0 || v_view.w < 0.5 || (v_view.w > 1.5 && v_view.w < 2.5) || len < 0.0001)	// w = 2: no snow at all
 			return color;
 
 		n /= len;
@@ -677,7 +677,8 @@ static const char* gpu_shader_snow = R"(
 		float up = (u_viewToWorld * n).y;
 		vec3 w = u_viewToWorld * p + u_camPos;
 
-		float flatness = smoothstep(0.45, 0.8, up);
+		// only (almost) horizontal tops; w = 3 (cars) wants an even flatter face so the curved shoulders stay clear
+		float flatness = v_view.w > 2.5 ? smoothstep(0.94, 0.99, up) : smoothstep(0.8, 0.95, up);
 		float patches = snowNoise(w.xz / 400.0) * 0.6 + snowNoise(w.xz / 70.0) * 0.4;
 		float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
 
@@ -733,7 +734,7 @@ const char* gpu_shader_32_rgba =
 		"	vec2 geom_ofs = vec2(0.5, 0.5);\n"\
 		"	vec4 fragPosition = (a_zw.y > 100.0 ? ofsMat * (Projection3D * vec4((a_position.xy + geom_ofs) * vec2(1.0,-1.0) * a_zw.y, a_zw.x, 1.0)) : (Projection * vec4(a_position.xy, 0.5, 1.0)));\n" \
 		"	gl_Position = fragPosition;\n"\
-		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, a_texcoord.w > 1.5 ? 2.0 : 1.0) : vec4(0.0);\n"
+		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, a_texcoord.w > 3.5 ? 3.0 : (a_texcoord.w > 1.5 ? 2.0 : 1.0)) : vec4(0.0);\n"
 #else
 #	define GTE_PERSPECTIVE_CORRECTION \
 		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"\
@@ -1349,6 +1350,10 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	if (sh->fogLoc != -1)
 		glUniform1f(sh->fogLoc, g_PreviousBlendMode == BM_NONE ? g_fogAmount : 0.0f);
 
+	// same for snow: car light reflections and shadows lie flat on the road and would turn into white squares
+	if (sh->snowLoc != -1)
+		glUniform1f(sh->snowLoc, g_PreviousBlendMode == BM_NONE ? g_snowAmount : 0.0f);
+
 	if (sh->snowSerial == g_snowSerial)
 		return;
 
@@ -1357,7 +1362,6 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	if (sh->snowLoc == -1)
 		return;
 
-	glUniform1f(sh->snowLoc, g_snowAmount);
 	glUniformMatrix3fv(sh->snowViewToWorldLoc, 1, GL_FALSE, g_snowViewToWorld);
 	glUniform3fv(sh->snowCamPosLoc, 1, g_snowCamPos);
 	glUniform3fv(sh->fogColorLoc, 1, g_fogColor);
