@@ -78,11 +78,15 @@ int g_dbg_texturelessMode = 0;
 
 // snow layer, see gpu_shader_snow
 static float g_snowAmount = 0.0f;
-static float g_snowViewToWorld[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-static float g_snowCamPos[3] = { 0, 0, 0 };
+static float g_snowGroundPos[3] = { 0, 0, 0 };		// a point on the road level, view space
+static float g_snowGroundUp[3] = { 0, -1, 0 };		// unit vector pointing up, view space
 static int g_snowSerial = 1;
 static float g_fogAmount = 0.0f;
 static float g_fogColor[3] = { 0.7f, 0.7f, 0.7f };
+// headlight beam of the player car in view space, see beamLight in gpu_shader_snow
+static float g_beamAmount = 0.0f;
+static float g_beamPos[3] = { 0, 0, 0 };
+static float g_beamDir[3] = { 0, 0, 1 };
 
 int g_cfg_pgxpTextureCorrection = 1;
 int g_cfg_pgxpZBuffer = 1;
@@ -504,10 +508,13 @@ typedef struct
 	GLint texLoc;
 	GLint lutLoc;
 	GLint snowLoc;
-	GLint snowViewToWorldLoc;
-	GLint snowCamPosLoc;
+	GLint snowGroundPosLoc;
+	GLint snowGroundUpLoc;
 	GLint fogLoc;
 	GLint fogColorLoc;
+	GLint beamLoc;
+	GLint beamPosLoc;
+	GLint beamDirLoc;
 #endif
 	int snowSerial;		// last g_snowSerial uploaded to this program
 } PSXGPU_Shader;
@@ -632,7 +639,10 @@ GLint u_texelSizeLoc;
 	"	uniform int bilinearFilter;\n"\
 	"	void main() {\n"\
 	"		vec4 color = (bilinearFilter > 0) ? bilinearTextureSample(v_texcoord.xy) : nearestTextureSample(v_texcoord.xy);\n"\
-	"		fragColor = dither(applyFog(applySnow(color) * v_color));\n"\
+	"		vec4 base = applySnow(color);\n"\
+	"		vec4 lit = base * v_color;\n"\
+	"		lit.rgb += base.rgb * beamLight();\n"\
+	"		fragColor = dither(applyFog(lit));\n"\
 	"	}\n"
 
 static const char* gpu_shader_common = R"(
@@ -644,23 +654,12 @@ static const char* gpu_shader_common = R"(
 )";
 
 #if USE_PGXP && (defined(RENDERER_OGL) || (OGLES_VERSION == 3))
-// Snow on every surface that faces up. The face normal comes from screen space derivatives of the view space
-// position, then it is rotated to world space with the camera matrix (checked on screen: up is +y there).
-// The noise is in world space so the snow stays put when the camera moves.
+// Snow on the road: faces that point up (normal from screen space derivatives of the view space position) and lie near
+// the road level (both given by the game in view space). The layer is closed and white, switched on at once.
 static const char* gpu_shader_snow = R"(
 	uniform float u_snow;
-	uniform mat3 u_viewToWorld;
-	uniform vec3 u_camPos;
-
-	float snowHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-
-	float snowNoise(vec2 p) {
-		vec2 i = floor(p);
-		vec2 f = fract(p);
-		f = f * f * (3.0 - 2.0 * f);
-		return mix(mix(snowHash(i), snowHash(i + vec2(1.0, 0.0)), f.x),
-				   mix(snowHash(i + vec2(0.0, 1.0)), snowHash(i + vec2(1.0, 1.0)), f.x), f.y);
-	}
+	uniform vec3 u_groundPos;
+	uniform vec3 u_groundUp;
 
 	vec4 applySnow(vec4 color) {
 		vec3 p = v_view.xyz * 128.0;
@@ -674,22 +673,12 @@ static const char* gpu_shader_snow = R"(
 		if (dot(n, p) > 0.0)
 			n = -n;		// face the camera
 
-		float up = (u_viewToWorld * n).y;
-		vec3 w = u_viewToWorld * p + u_camPos;
+		// only the road: (almost) horizontal faces within ~2 m of the road level, no roofs and no walls
+		float up = dot(n, u_groundUp);
+		float height = abs(dot(p - u_groundPos, u_groundUp));
+		float snow = smoothstep(0.8, 0.95, up) * (1.0 - smoothstep(250.0, 400.0, height)) * u_snow;
 
-		// only (almost) horizontal tops; w = 3 (cars) wants an even flatter face so the curved shoulders stay clear
-		float flatness = v_view.w > 2.5 ? smoothstep(0.94, 0.99, up) : smoothstep(0.8, 0.95, up);
-		float patches = snowNoise(w.xz / 400.0) * 0.6 + snowNoise(w.xz / 70.0) * 0.4;
-		float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
-
-		// dark texels (cracks, gaps) hold less snow
-		float cover = flatness * u_snow * 1.5 * mix(0.75, 1.0, smoothstep(0.1, 0.5, lum));
-		float snow = smoothstep(patches * 0.7, patches * 0.7 + 0.2, cover);
-
-		vec3 snowCol = vec3(0.92, 0.95, 1.0) * (0.9 + 0.1 * patches);
-		snowCol = mix(snowCol * 0.82, snowCol, smoothstep(0.4, 1.0, snow));	// thin edges are greyer
-
-		color.rgb = mix(color.rgb, snowCol, snow);
+		color.rgb = mix(color.rgb, vec3(0.93, 0.95, 1.0), snow);
 		return color;
 	}
 
@@ -704,11 +693,41 @@ static const char* gpu_shader_snow = R"(
 		color.rgb = mix(color.rgb, u_fogColor, f);
 		return color;
 	}
+
+	// Headlight of the player car: a cone in view space, added on top of the vertex lighting.
+	uniform float u_beam;
+	uniform vec3 u_beamPos;
+	uniform vec3 u_beamDir;
+
+	vec3 beamLight() {
+		vec3 p = v_view.xyz * 128.0;
+		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
+		float len = length(n);
+
+		if (u_beam <= 0.0 || v_view.w < 0.5 || len < 0.0001)
+			return vec3(0.0);
+
+		n /= len;
+		if (dot(n, p) > 0.0)
+			n = -n;
+
+		vec3 toLight = u_beamPos - p;
+		float dist = max(length(toLight), 1.0);
+		vec3 l = toLight / dist;
+
+		float cone = smoothstep(0.80, 0.95, dot(-l, u_beamDir));
+		float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(300.0, 2500.0, dist);	// no hot spot right at the nose
+		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
+		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
+
+		return vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * atten * ndl * dark);
+	}
 )";
 #else
 static const char* gpu_shader_snow = R"(
 	vec4 applySnow(vec4 color) { return color; }
 	vec4 applyFog(vec4 color) { return color; }
+	vec3 beamLight() { return vec3(0.0); }
 )";
 #endif
 
@@ -721,7 +740,10 @@ const char* gpu_shader_32_rgba =
 	"	void main() {\n"\
 	"		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"\
 	"		vec4 color = texture2D(s_texture, tc);\n"\
-	"		fragColor = dither(applyFog(applySnow(color) * v_color));\n"\
+	"		vec4 base = applySnow(color);\n"\
+	"		vec4 lit = base * v_color;\n"\
+	"		lit.rgb += base.rgb * beamLight();\n"\
+	"		fragColor = dither(applyFog(lit));\n"\
 	"	}\n";
 
 #if USE_PGXP
@@ -734,7 +756,7 @@ const char* gpu_shader_32_rgba =
 		"	vec2 geom_ofs = vec2(0.5, 0.5);\n"\
 		"	vec4 fragPosition = (a_zw.y > 100.0 ? ofsMat * (Projection3D * vec4((a_position.xy + geom_ofs) * vec2(1.0,-1.0) * a_zw.y, a_zw.x, 1.0)) : (Projection * vec4(a_position.xy, 0.5, 1.0)));\n" \
 		"	gl_Position = fragPosition;\n"\
-		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, a_texcoord.w > 3.5 ? 3.0 : (a_texcoord.w > 1.5 ? 2.0 : 1.0)) : vec4(0.0);\n"
+		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, a_texcoord.w > 1.5 ? 2.0 : 1.0) : vec4(0.0);\n"
 #else
 #	define GTE_PERSPECTIVE_CORRECTION \
 		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"\
@@ -1014,10 +1036,13 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->texLoc = glGetUniformLocation(sh->shader, "s_texture");
 	sh->lutLoc = glGetUniformLocation(sh->shader, "s_rgLut");
 	sh->snowLoc = glGetUniformLocation(sh->shader, "u_snow");
-	sh->snowViewToWorldLoc = glGetUniformLocation(sh->shader, "u_viewToWorld");
-	sh->snowCamPosLoc = glGetUniformLocation(sh->shader, "u_camPos");
+	sh->snowGroundPosLoc = glGetUniformLocation(sh->shader, "u_groundPos");
+	sh->snowGroundUpLoc = glGetUniformLocation(sh->shader, "u_groundUp");
 	sh->fogLoc = glGetUniformLocation(sh->shader, "u_fog");
 	sh->fogColorLoc = glGetUniformLocation(sh->shader, "u_fogColor");
+	sh->beamLoc = glGetUniformLocation(sh->shader, "u_beam");
+	sh->beamPosLoc = glGetUniformLocation(sh->shader, "u_beamPos");
+	sh->beamDirLoc = glGetUniformLocation(sh->shader, "u_beamDir");
 	sh->snowSerial = 0;
 #if USE_PGXP
 	sh->projection3DLoc = glGetUniformLocation(sh->shader, "Projection3D");
@@ -1327,11 +1352,11 @@ void GR_SetShader(const ShaderID shader)
 }
 
 
-void PsyX_SetSnow(float amount, const float* viewToWorld, const float* camPos)
+void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp)
 {
 	g_snowAmount = amount;
-	memcpy(g_snowViewToWorld, viewToWorld, sizeof(g_snowViewToWorld));
-	memcpy(g_snowCamPos, camPos, sizeof(g_snowCamPos));
+	memcpy(g_snowGroundPos, groundPos, sizeof(g_snowGroundPos));
+	memcpy(g_snowGroundUp, groundUp, sizeof(g_snowGroundUp));
 	g_snowSerial++;
 }
 
@@ -1342,10 +1367,22 @@ void PsyX_SetFog(float amount, const float* color)
 	g_snowSerial++;
 }
 
+void PsyX_SetBeam(float amount, const float* pos, const float* dir)
+{
+	g_beamAmount = amount;
+	memcpy(g_beamPos, pos, sizeof(g_beamPos));
+	memcpy(g_beamDir, dir, sizeof(g_beamDir));
+	g_snowSerial++;
+}
+
 // uniforms belong to a program, so every program has to get the current weather state once after it changed
 static void GR_UploadSnow(PSXGPU_Shader* sh)
 {
 #if USE_OPENGL
+	// glows and shadows are blended, the beam only lights opaque geometry
+	if (sh->beamLoc != -1)
+		glUniform1f(sh->beamLoc, g_PreviousBlendMode == BM_NONE ? g_beamAmount : 0.0f);
+
 	// blended primitives (glows, shadows) would turn into grey patches, so fog is only for opaque ones
 	if (sh->fogLoc != -1)
 		glUniform1f(sh->fogLoc, g_PreviousBlendMode == BM_NONE ? g_fogAmount : 0.0f);
@@ -1362,9 +1399,15 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	if (sh->snowLoc == -1)
 		return;
 
-	glUniformMatrix3fv(sh->snowViewToWorldLoc, 1, GL_FALSE, g_snowViewToWorld);
-	glUniform3fv(sh->snowCamPosLoc, 1, g_snowCamPos);
+	glUniform3fv(sh->snowGroundPosLoc, 1, g_snowGroundPos);
+	glUniform3fv(sh->snowGroundUpLoc, 1, g_snowGroundUp);
 	glUniform3fv(sh->fogColorLoc, 1, g_fogColor);
+
+	if (sh->beamPosLoc != -1)
+	{
+		glUniform3fv(sh->beamPosLoc, 1, g_beamPos);
+		glUniform3fv(sh->beamDirLoc, 1, g_beamDir);
+	}
 #endif
 }
 

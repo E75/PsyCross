@@ -79,12 +79,15 @@ extern void PsyX_SetCursorPosition(int x, int y);
 /* Sets mouse relative movement */
 extern void PsyX_SetCursorRelative(int enable);
 
-/* Snow layer on up-facing 3D surfaces: amount 0..1, viewToWorld = 3x3 camera matrix (rows of the view matrix, 1.0 = unit),
-   camPos = camera position in world units */
-extern void PsyX_SetSnow(float amount, const float* viewToWorld, const float* camPos);
+/* Snow layer on the road: up-facing 3D surfaces near the road level. amount 0..1, groundPos = a point on the road level and
+   groundUp = unit vector pointing up, both in view space (GTE units) */
+extern void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp);
 
 /* Distance fog on opaque 3D geometry: amount 0..1 (1 = about 8 cells of visibility), color = rgb 0..1 */
 extern void PsyX_SetFog(float amount, const float* color);
+
+/* Headlight cone of the player car, position and direction in view space (GTE units), amount 0..1 */
+extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
 
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
