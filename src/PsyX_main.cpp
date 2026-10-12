@@ -670,13 +670,29 @@ void PsyX_SetCursorPosition(int x, int y)
 	SDL_WarpMouseInWindow(g_window, x, y);
 }
 
-extern void PsyX_SetCursorRelative(int enable)
-{
-	SDL_SetRelativeMouseMode((SDL_bool)enable);
-}
-
+static int g_wantRelativeMouse = 0;
 static int g_mouseDeltaX = 0;
 static int g_mouseDeltaY = 0;
+
+// the mouse is only captured while the window has input focus, so clicking outside the game frees it
+static void PsyX_ApplyRelativeMouse()
+{
+	int focused = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+
+	SDL_SetRelativeMouseMode((SDL_bool)(g_wantRelativeMouse && focused));
+
+	if (!focused)
+	{
+		g_mouseDeltaX = 0;
+		g_mouseDeltaY = 0;
+	}
+}
+
+extern void PsyX_SetCursorRelative(int enable)
+{
+	g_wantRelativeMouse = enable;
+	PsyX_ApplyRelativeMouse();
+}
 
 int PsyX_GetMouseDelta(int* dx, int* dy)
 {
@@ -685,7 +701,7 @@ int PsyX_GetMouseDelta(int* dx, int* dy)
 	g_mouseDeltaX = 0;
 	g_mouseDeltaY = 0;
 
-	return SDL_GetRelativeMouseMode() == SDL_TRUE;
+	return g_wantRelativeMouse;
 }
 
 void PsyX_Sys_DoDebugKeys(int nKey, char down); // forward decl
@@ -722,6 +738,10 @@ void PsyX_Sys_DoPollEvent()
 					break;
 				case SDL_WINDOWEVENT_CLOSE:
 					PsyX_Exit();
+					break;
+				case SDL_WINDOWEVENT_FOCUS_GAINED:
+				case SDL_WINDOWEVENT_FOCUS_LOST:
+					PsyX_ApplyRelativeMouse();
 					break;
 				}
 				break;
