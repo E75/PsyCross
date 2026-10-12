@@ -83,6 +83,16 @@ extern void PsyX_SetCursorRelative(int enable);
    The return value is 1 when relative mode is on, else 0. */
 extern int PsyX_GetMouseDelta(int* dx, int* dy);
 
+/* Snow layer on the road: up-facing 3D surfaces near the road level. amount 0..1, groundPos = a point on the road level and
+   groundUp = unit vector pointing up, both in view space (GTE units) */
+extern void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp);
+
+/* Distance fog on opaque 3D geometry: amount 0..1 (1 = about 8 cells of visibility), color = rgb 0..1 */
+extern void PsyX_SetFog(float amount, const float* color);
+
+/* Headlight cone of the player car, position and direction in view space (GTE units), amount 0..1 */
+extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
+
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
 

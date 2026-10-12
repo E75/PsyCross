@@ -774,6 +774,10 @@ void PsyX_Sys_DoPollEvent()
 						SDL_GetWindowSize(g_window, &g_windowWidth, &g_windowHeight);
 						GR_ResetDevice();
 					}
+					else
+					{
+						PsyX_Sys_DoDebugKeys(nKey, (event.type == SDL_KEYUP) ? 0 : 1);
+					}
 					break;
 				}
 
