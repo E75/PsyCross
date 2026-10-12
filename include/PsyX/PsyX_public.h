@@ -79,6 +79,10 @@ extern void PsyX_SetCursorPosition(int x, int y);
 /* Sets mouse relative movement */
 extern void PsyX_SetCursorRelative(int enable);
 
+/* Returns the mouse movement collected since the last call (only counted while relative mode is on) and clears it.
+   The return value is 1 when relative mode is on, else 0. */
+extern int PsyX_GetMouseDelta(int* dx, int* dy);
+
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
 

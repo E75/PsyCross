@@ -675,6 +675,19 @@ extern void PsyX_SetCursorRelative(int enable)
 	SDL_SetRelativeMouseMode((SDL_bool)enable);
 }
 
+static int g_mouseDeltaX = 0;
+static int g_mouseDeltaY = 0;
+
+int PsyX_GetMouseDelta(int* dx, int* dy)
+{
+	*dx = g_mouseDeltaX;
+	*dy = g_mouseDeltaY;
+	g_mouseDeltaX = 0;
+	g_mouseDeltaY = 0;
+
+	return SDL_GetRelativeMouseMode() == SDL_TRUE;
+}
+
 void PsyX_Sys_DoDebugKeys(int nKey, char down); // forward decl
 void PsyX_Sys_DoDebugMouseMotion(int x, int y, int dx, int dy);
 
@@ -713,6 +726,11 @@ void PsyX_Sys_DoPollEvent()
 				}
 				break;
 			case SDL_MOUSEMOTION:
+				if (SDL_GetRelativeMouseMode())
+				{
+					g_mouseDeltaX += event.motion.xrel;
+					g_mouseDeltaY += event.motion.yrel;
+				}
 
 				PsyX_Sys_DoDebugMouseMotion(event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel);
 				break;
