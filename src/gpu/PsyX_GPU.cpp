@@ -56,6 +56,7 @@ GrVertex g_vertexBuffer[MAX_VERTEX_BUFFER_SIZE];
 GPUDrawSplit g_splits[MAX_DRAW_SPLITS];
 
 int g_vertexIndex = 0;
+int g_vertexPeak = 0;	// most vertices of a frame, for the draw distance test log
 int g_splitIndex = 0;
 
 void ClearSplits()
@@ -194,8 +195,21 @@ inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, us
 		float dispW, dispH;
 		DrawEnvDimensions(dispW, dispH);
 
-		const float gteOfsX = fmodf(vd.ofx, dispW) - dispW * 0.5f;
-		const float gteOfsY = fmodf(vd.ofy, dispH) - dispH * 0.5f;
+		// the GTE offset and the draw size are the same for nearly every vertex of a frame: keep the last fmodf results
+		static float lastOfx = -1.0f, lastOfy = -1.0f, lastW = 0.0f, lastH = 0.0f, lastGteOfsX = 0.0f, lastGteOfsY = 0.0f;
+
+		if (vd.ofx != lastOfx || vd.ofy != lastOfy || dispW != lastW || dispH != lastH)
+		{
+			lastOfx = vd.ofx;
+			lastOfy = vd.ofy;
+			lastW = dispW;
+			lastH = dispH;
+			lastGteOfsX = fmodf(vd.ofx, dispW) - dispW * 0.5f;
+			lastGteOfsY = fmodf(vd.ofy, dispH) - dispH * 0.5f;
+		}
+
+		const float gteOfsX = lastGteOfsX;
+		const float gteOfsY = lastGteOfsY;
 
 		v->ofsX = (ofsX + gteOfsX) / dispW * 2.0f;
 		v->ofsY = (ofsY + gteOfsY) / dispH * 2.0f;
@@ -799,6 +813,9 @@ void DrawAllSplits()
 #endif // _DEBUG
 
 	// next code ideally should be called before EndScene
+	if (g_vertexIndex > g_vertexPeak)
+		g_vertexPeak = g_vertexIndex;
+
 	GR_UpdateVertexBuffer(g_vertexBuffer, g_vertexIndex);
 
 	for (int i = 1; i <= g_splitIndex; i++)
