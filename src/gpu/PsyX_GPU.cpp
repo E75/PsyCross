@@ -44,8 +44,8 @@ struct GPUDrawSplit
 
 	int				drawPrimMode;
 
-	u_short			startVertex;
-	u_short			numVerts;
+	u_int			startVertex;
+	u_int			numVerts;
 
 	const char*		debugText;
 };

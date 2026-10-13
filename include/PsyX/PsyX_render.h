@@ -116,7 +116,7 @@
 #define TPAGE_WIDTH		(256)
 #define TPAGE_HEIGHT	(256)
 
-#define MAX_VERTEX_BUFFER_SIZE	(1 << (sizeof(ushort) * 8))
+#define MAX_VERTEX_BUFFER_SIZE	(1 << 18)	// was 1 << 16: the wide draw distance came close to it and the vertices are written without a bound check
 
 #pragma pack(push,1)
 typedef struct
