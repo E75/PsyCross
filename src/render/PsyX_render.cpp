@@ -82,6 +82,7 @@ static float g_snowGroundPos[3] = { 0, 0, 0 };		// a point on the road level, vi
 static float g_snowGroundUp[3] = { 0, -1, 0 };		// unit vector pointing up, view space
 static int g_snowSerial = 1;
 static float g_fogAmount = 0.0f;
+static float g_fogExtinction = 0.0f;
 static float g_fogColor[3] = { 0.7f, 0.7f, 0.7f };
 // headlight beam of the player car in view space, see beamLight in gpu_shader_snow
 static float g_beamAmount = 0.0f;
@@ -91,6 +92,7 @@ static float g_beamDir[3] = { 0, 0, 1 };
 static int g_volLightCount = 0;
 static float g_volLightPos[PSYX_MAX_VOLUME_LIGHTS * 3];
 static float g_volLightCol[PSYX_MAX_VOLUME_LIGHTS * 4];
+static float g_volLightDir[PSYX_MAX_VOLUME_LIGHTS * 3];
 static float g_volDensity = 0.0f;
 static float g_beamVolume = 0.0f;
 // height fog and sun glow of the fog, see applyFog in gpu_shader_snow
@@ -526,12 +528,15 @@ typedef struct
 	GLint snowGroundUpLoc;
 	GLint fogLoc;
 	GLint fogColorLoc;
+	GLint fogFadeLoc;
+	GLint fogExtLoc;
 	GLint beamLoc;
 	GLint beamPosLoc;
 	GLint beamDirLoc;
 	GLint lightCountLoc;
 	GLint lightPosLoc;
 	GLint lightColLoc;
+	GLint lightDirLoc;
 	GLint volDensityLoc;
 	GLint beamVolumeLoc;
 	GLint viewScaleLoc;
@@ -714,6 +719,8 @@ static const char* gpu_shader_snow = R"(
 	// applied after the vertex lighting. Falls off with the square of the distance so the near street stays clear.
 	uniform float u_fog;
 	uniform vec3 u_fogColor;
+	uniform float u_fogExt;	// weather fog: extinction per unit, light fades exponentially along the ray (Beer-Lambert)
+	uniform float u_fogFade;	// added / subtracted primitives (glows, shadows): fog weakens them instead of tinting them
 
 	// Height fog density * exp(-falloff * height), integrated along the ray from the camera (height u_camHeight above
 	// sea level) to the pixel; the fog colour turns towards u_sunColor when looking into the sun (Henyey-Greenstein).
@@ -728,7 +735,7 @@ static const char* gpu_shader_snow = R"(
 	vec4 applyFog(vec4 color) {
 		float d = length(v_view.xyz) * 128.0;
 		float k = d * u_fog * 0.000108;
-		float f = v_view.w > 0.5 ? 1.0 - exp(-k * k) : 0.0;
+		float f = v_view.w > 0.5 ? 1.0 - exp(-k * k - d * u_fogExt) : 0.0;
 		vec3 fogColor = u_fogColor;
 
 		if (u_hfDensity > 0.0 && v_view.w > 0.5)
@@ -751,11 +758,22 @@ static const char* gpu_shader_snow = R"(
 			}
 		}
 
-		color.rgb = mix(color.rgb, fogColor, f);
+		if (u_fogFade > 0.0)
+			color.rgb *= 1.0 - f * u_fogFade;
+		else
+			color.rgb = mix(color.rgb, fogColor, f);
 		return color;
 	}
 
-	// Headlight of the player car: a cone in view space, added on top of the vertex lighting.
+	// lamps and headlights near the camera (view space), see volumeLight; u_volDensity is 0 for blended primitives
+	uniform int u_lightCount;
+	uniform vec3 u_lightPos[16];
+	uniform vec4 u_lightCol[16];	// rgb, w = radius
+	uniform vec3 u_lightDir[16];	// headlight direction, 0 for a lamp
+	uniform float u_volDensity;
+	uniform float u_beamVolume;
+
+	// Headlights: the cone of the player car and the cones of the other cars, added on top of the vertex lighting.
 	uniform float u_beam;
 	uniform vec3 u_beamPos;
 	uniform vec3 u_beamDir;
@@ -765,12 +783,37 @@ static const char* gpu_shader_snow = R"(
 		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
 		float len = length(n);
 
-		if (u_beam <= 0.0 || v_view.w < 0.5 || len < 0.0001)
+		if ((u_beam <= 0.0 && u_volDensity <= 0.0) || v_view.w < 0.5 || len < 0.0001)
 			return vec3(0.0);
 
 		n /= len;
 		if (dot(n, p) > 0.0)
 			n = -n;
+
+		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
+		vec3 sum = vec3(0.0);
+
+		// other cars: two lamps each, shorter reach than the player's beam, so a car right in front of them is lit most
+		for (int i = 0; i < 16; i++)
+		{
+			if (i >= u_lightCount || u_volDensity <= 0.0)
+				break;
+
+			if (dot(u_lightDir[i], u_lightDir[i]) < 0.25)
+				continue;
+
+			vec3 toLamp = u_lightPos[i] - p;
+			float lampDist = max(length(toLamp), 1.0);
+			vec3 ll = toLamp / lampDist;
+			float lampCone = smoothstep(0.6, 0.9, dot(-ll, normalize(u_lightDir[i])));
+			float lampAtten = clamp(1.0 - lampDist / 7000.0, 0.0, 1.0);
+			lampAtten *= lampAtten * smoothstep(100.0, 600.0, lampDist);
+			float wrap = max((dot(n, ll) + 0.35) / 1.35, 0.0);	// a roof or side at a grazing angle still catches some
+			sum += vec3(1.0, 0.92, 0.75) * (lampCone * lampAtten * wrap * dark * 0.8);
+		}
+
+		if (u_beam <= 0.0)
+			return sum;
 
 		vec3 toLight = u_beamPos - p;
 		float dist = max(length(toLight), 1.0);
@@ -779,19 +822,13 @@ static const char* gpu_shader_snow = R"(
 		float cone = smoothstep(0.80, 0.95, dot(-l, u_beamDir));
 		float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(300.0, 2500.0, dist);	// no hot spot right at the nose
 		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
-		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
 
 		// the road is lit at a grazing angle (ndl near 0.4), hence the gain
-		return vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
+		return sum + vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
 	}
 
 	// Light scattered by the air between the camera and the pixel: point lights (closed form of the integral of
 	// 1 / (d^2 + k) along the ray) and the headlight cone (marched). Added after the fog, so it lies on top of it.
-	uniform int u_lightCount;
-	uniform vec3 u_lightPos[16];
-	uniform vec4 u_lightCol[16];	// rgb, w = radius
-	uniform float u_volDensity;
-	uniform float u_beamVolume;
 
 	vec3 volumeLight() {
 		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
@@ -1164,12 +1201,15 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->snowGroundUpLoc = glGetUniformLocation(sh->shader, "u_groundUp");
 	sh->fogLoc = glGetUniformLocation(sh->shader, "u_fog");
 	sh->fogColorLoc = glGetUniformLocation(sh->shader, "u_fogColor");
+	sh->fogFadeLoc = glGetUniformLocation(sh->shader, "u_fogFade");
+	sh->fogExtLoc = glGetUniformLocation(sh->shader, "u_fogExt");
 	sh->beamLoc = glGetUniformLocation(sh->shader, "u_beam");
 	sh->beamPosLoc = glGetUniformLocation(sh->shader, "u_beamPos");
 	sh->beamDirLoc = glGetUniformLocation(sh->shader, "u_beamDir");
 	sh->lightCountLoc = glGetUniformLocation(sh->shader, "u_lightCount");
 	sh->lightPosLoc = glGetUniformLocation(sh->shader, "u_lightPos[0]");
 	sh->lightColLoc = glGetUniformLocation(sh->shader, "u_lightCol[0]");
+	sh->lightDirLoc = glGetUniformLocation(sh->shader, "u_lightDir[0]");
 	sh->volDensityLoc = glGetUniformLocation(sh->shader, "u_volDensity");
 	sh->beamVolumeLoc = glGetUniformLocation(sh->shader, "u_beamVolume");
 	sh->viewScaleLoc = glGetUniformLocation(sh->shader, "u_viewScale");
@@ -1497,9 +1537,10 @@ void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp)
 	g_snowSerial++;
 }
 
-void PsyX_SetFog(float amount, const float* color)
+void PsyX_SetFog(float amount, float extinction, const float* color)
 {
 	g_fogAmount = amount;
+	g_fogExtinction = extinction;
 	memcpy(g_fogColor, color, sizeof(g_fogColor));
 	g_snowSerial++;
 }
@@ -1512,7 +1553,7 @@ void PsyX_SetBeam(float amount, const float* pos, const float* dir)
 	g_snowSerial++;
 }
 
-void PsyX_SetVolumeLights(int count, const float* pos, const float* color, float density)
+void PsyX_SetVolumeLights(int count, const float* pos, const float* color, const float* dir, float density)
 {
 	if (count > PSYX_MAX_VOLUME_LIGHTS)
 		count = PSYX_MAX_VOLUME_LIGHTS;
@@ -1520,6 +1561,7 @@ void PsyX_SetVolumeLights(int count, const float* pos, const float* color, float
 	g_volLightCount = count > 0 ? count : 0;
 	memcpy(g_volLightPos, pos, sizeof(float) * 3 * g_volLightCount);
 	memcpy(g_volLightCol, color, sizeof(float) * 4 * g_volLightCount);
+	memcpy(g_volLightDir, dir, sizeof(float) * 3 * g_volLightCount);
 	g_volDensity = g_volLightCount > 0 ? density : 0.0f;
 	g_snowSerial++;
 }
@@ -1549,12 +1591,16 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	if (sh->beamLoc != -1)
 		glUniform1f(sh->beamLoc, g_PreviousBlendMode == BM_NONE ? g_beamAmount : 0.0f);
 
-	// blended primitives (glows, shadows) would turn into grey patches, so fog is only for opaque ones
+	// blended primitives get fog too (an unfogged shadow stayed dark on fogged ground): glows and shadows fade with it,
+	// a glow less, as a light shines farther through fog
 	if (sh->fogLoc != -1)
-		glUniform1f(sh->fogLoc, g_PreviousBlendMode == BM_NONE ? g_fogAmount : 0.0f);
+		glUniform1f(sh->fogLoc, g_fogAmount);
+
+	if (sh->fogFadeLoc != -1)
+		glUniform1f(sh->fogFadeLoc, g_PreviousBlendMode == BM_SUBTRACT ? 1.0f : (g_PreviousBlendMode == BM_ADD || g_PreviousBlendMode == BM_ADD_QUATER_SOURCE) ? 0.6f : 0.0f);
 
 	if (sh->hfDensityLoc != -1)
-		glUniform1f(sh->hfDensityLoc, g_PreviousBlendMode == BM_NONE ? g_hfDensity : 0.0f);
+		glUniform1f(sh->hfDensityLoc, g_hfDensity);
 
 	// same for snow: car light reflections and shadows lie flat on the road and would turn into white squares
 	if (sh->snowLoc != -1)
@@ -1583,6 +1629,7 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	glUniform3fv(sh->snowGroundPosLoc, 1, g_snowGroundPos);
 	glUniform3fv(sh->snowGroundUpLoc, 1, g_snowGroundUp);
 	glUniform3fv(sh->fogColorLoc, 1, g_fogColor);
+	glUniform1f(sh->fogExtLoc, g_fogExtinction);
 
 	if (sh->hfFalloffLoc != -1)
 	{
@@ -1608,6 +1655,7 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 		{
 			glUniform3fv(sh->lightPosLoc, g_volLightCount, g_volLightPos);
 			glUniform4fv(sh->lightColLoc, g_volLightCount, g_volLightCol);
+			glUniform3fv(sh->lightDirLoc, g_volLightCount, g_volLightDir);
 		}	}
 #endif
 }

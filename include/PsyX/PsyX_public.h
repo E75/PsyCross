@@ -87,16 +87,18 @@ extern int PsyX_GetMouseDelta(int* dx, int* dy);
    groundUp = unit vector pointing up, both in view space (GTE units) */
 extern void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp);
 
-/* Distance fog on opaque 3D geometry: amount 0..1 (1 = about 8 cells of visibility), color = rgb 0..1 */
-extern void PsyX_SetFog(float amount, const float* color);
+/* Distance fog on 3D geometry: amount 0..1 (1 = about 8 cells of visibility, falls off with the square of the distance),
+   extinction = weather fog per GTE unit (exponential), color = rgb 0..1 */
+extern void PsyX_SetFog(float amount, float extinction, const float* color);
 
 /* Headlight cone of the player car, position and direction in view space (GTE units), amount 0..1 */
 extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
 
 /* Lamps that light the air (halos, also in front of walls): pos = count * 3 floats in view space like PsyX_SetBeam,
-   color = count * 4 floats (rgb 0..1, radius), density 0 = off. amount = in-scattering of the headlight cone. */
+   color = count * 4 floats (rgb 0..1, radius), dir = count * 3 floats (unit headlight direction that also lights
+   surfaces in front of it, 0 for a lamp), density 0 = off. amount = in-scattering of the headlight cone. */
 #define PSYX_MAX_VOLUME_LIGHTS 16
-extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, float density);
+extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, const float* dir, float density);
 extern void PsyX_SetVolumeBeam(float amount);
 
 /* Height fog on top of the distance fog: optical depth heightDensity * exp(-heightFalloff * height) per unit, height above
