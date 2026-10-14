@@ -93,6 +93,14 @@ static float g_volLightPos[PSYX_MAX_VOLUME_LIGHTS * 3];
 static float g_volLightCol[PSYX_MAX_VOLUME_LIGHTS * 4];
 static float g_volDensity = 0.0f;
 static float g_beamVolume = 0.0f;
+// height fog and sun glow of the fog, see applyFog in gpu_shader_snow
+static float g_hfFalloff = 0.0f;
+static float g_hfDensity = 0.0f;
+static float g_worldUp[3] = { 0, -1, 0 };
+static float g_camHeight = 0.0f;
+static float g_sunDir[3] = { 0, 0, 1 };
+static float g_sunColor[3] = { 1, 1, 1 };
+static float g_sunScatter = 0.0f;
 
 int g_cfg_pgxpTextureCorrection = 1;
 int g_cfg_pgxpZBuffer = 1;
@@ -527,6 +535,13 @@ typedef struct
 	GLint volDensityLoc;
 	GLint beamVolumeLoc;
 	GLint viewScaleLoc;
+	GLint hfFalloffLoc;
+	GLint hfDensityLoc;
+	GLint worldUpLoc;
+	GLint camHeightLoc;
+	GLint sunDirLoc;
+	GLint sunColorLoc;
+	GLint sunScatterLoc;
 #endif
 	int snowSerial;		// last g_snowSerial uploaded to this program
 } PSXGPU_Shader;
@@ -694,15 +709,49 @@ static const char* gpu_shader_snow = R"(
 		return color;
 	}
 
+	uniform vec2 u_viewScale;	// draw size * 128: v_view.xy hold view x, y / 128 / draw size - 0.5 (ScreenCoordsToEmulator)
+
 	// applied after the vertex lighting. Falls off with the square of the distance so the near street stays clear.
 	uniform float u_fog;
 	uniform vec3 u_fogColor;
+
+	// Height fog density * exp(-falloff * height), integrated along the ray from the camera (height u_camHeight above
+	// sea level) to the pixel; the fog colour turns towards u_sunColor when looking into the sun (Henyey-Greenstein).
+	uniform float u_hfFalloff;
+	uniform float u_hfDensity;
+	uniform vec3 u_worldUp;		// view space, GTE units (y down)
+	uniform float u_camHeight;
+	uniform vec3 u_sunDir;
+	uniform vec3 u_sunColor;
+	uniform float u_sunScatter;
 
 	vec4 applyFog(vec4 color) {
 		float d = length(v_view.xyz) * 128.0;
 		float k = d * u_fog * 0.000108;
 		float f = v_view.w > 0.5 ? 1.0 - exp(-k * k) : 0.0;
-		color.rgb = mix(color.rgb, u_fogColor, f);
+		vec3 fogColor = u_fogColor;
+
+		if (u_hfDensity > 0.0 && v_view.w > 0.5)
+		{
+			vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
+			float t = length(p);
+
+			// the sky dome lies 256 times farther out (PGXP z scale of sky.c) and keeps its own colours
+			if (t > 1.0 && t < 400000.0)
+			{
+				float x = u_hfFalloff * dot(p, u_worldUp);	// falloff * height gained between camera and pixel
+				float shape = abs(x) > 0.001 ? (1.0 - exp(-x)) / x : 1.0 - 0.5 * x;
+				float tau = u_hfDensity * exp(-u_hfFalloff * u_camHeight) * t * shape;
+				f = 1.0 - (1.0 - f) * exp(-tau);
+
+				float g = 0.6;
+				float c = dot(p / t, u_sunDir);
+				float phase = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * c, 1.5) * (1.0 - g) * (1.0 - g) / (1.0 + g);	// 1 into the sun
+				fogColor = mix(fogColor, u_sunColor, clamp(u_sunScatter * phase, 0.0, 1.0));
+			}
+		}
+
+		color.rgb = mix(color.rgb, fogColor, f);
 		return color;
 	}
 
@@ -710,8 +759,6 @@ static const char* gpu_shader_snow = R"(
 	uniform float u_beam;
 	uniform vec3 u_beamPos;
 	uniform vec3 u_beamDir;
-
-	uniform vec2 u_viewScale;	// draw size * 128: v_view.xy hold view x, y / 128 / draw size - 0.5 (ScreenCoordsToEmulator)
 
 	vec3 beamLight() {
 		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
@@ -763,19 +810,19 @@ static const char* gpu_shader_snow = R"(
 
 			vec3 L = u_lightPos[i];
 			float radius = u_lightCol[i].w;	// halo radius
-			float k = radius * 0.1;			// core size: no infinite hot spot when the ray passes through the lamp
+			float k = radius * 0.15;		// core size: no infinite hot spot when the ray passes through the lamp
 			float b = dot(L, r);
 			float miss2 = max(dot(L, L) - b * b, 0.0);	// squared distance of the ray from the lamp
 			float h = sqrt(miss2 + k * k);
 			float scat = (atan((t - b) / h) - atan(-b / h)) * k / h;	// pi at the core
-			// only rays that pass the lamp within its halo, and no lamp whose halo holds the camera (it would tint the whole view)
+			// soft edge (no visible disc), and no lamp whose halo holds the camera (it would tint the whole view)
 			float dist = length(L);
-			float reach = (1.0 - smoothstep(radius * 0.5, radius, sqrt(miss2))) * smoothstep(radius, radius * 3.0, dist) * (1.0 - smoothstep(12000.0, 24000.0, dist));
+			float reach = exp(-miss2 / (radius * radius)) * smoothstep(radius * 2.0, radius * 6.0, dist) * (1.0 - smoothstep(12000.0, 24000.0, dist));
 
 			sum += u_lightCol[i].rgb * (scat * reach);
 		}
 
-		sum *= u_volDensity * 0.08;
+		sum *= u_volDensity * 0.05;
 
 		if (u_beamVolume > 0.0 && u_beam > 0.0)
 		{
@@ -1126,6 +1173,13 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->volDensityLoc = glGetUniformLocation(sh->shader, "u_volDensity");
 	sh->beamVolumeLoc = glGetUniformLocation(sh->shader, "u_beamVolume");
 	sh->viewScaleLoc = glGetUniformLocation(sh->shader, "u_viewScale");
+	sh->hfFalloffLoc = glGetUniformLocation(sh->shader, "u_hfFalloff");
+	sh->hfDensityLoc = glGetUniformLocation(sh->shader, "u_hfDensity");
+	sh->worldUpLoc = glGetUniformLocation(sh->shader, "u_worldUp");
+	sh->camHeightLoc = glGetUniformLocation(sh->shader, "u_camHeight");
+	sh->sunDirLoc = glGetUniformLocation(sh->shader, "u_sunDir");
+	sh->sunColorLoc = glGetUniformLocation(sh->shader, "u_sunColor");
+	sh->sunScatterLoc = glGetUniformLocation(sh->shader, "u_sunScatter");
 	sh->snowSerial = 0;
 #if USE_PGXP
 	sh->projection3DLoc = glGetUniformLocation(sh->shader, "Projection3D");
@@ -1475,6 +1529,18 @@ void PsyX_SetVolumeBeam(float amount)
 	g_beamVolume = amount;
 }
 
+void PsyX_SetAtmosphere(float heightFalloff, float heightDensity, const float* worldUpView, float camHeight, const float* sunDirView, const float* sunColor, float sunScatter)
+{
+	g_hfFalloff = heightFalloff;
+	g_hfDensity = heightDensity;
+	memcpy(g_worldUp, worldUpView, sizeof(g_worldUp));
+	g_camHeight = camHeight;
+	memcpy(g_sunDir, sunDirView, sizeof(g_sunDir));
+	memcpy(g_sunColor, sunColor, sizeof(g_sunColor));
+	g_sunScatter = sunScatter;
+	g_snowSerial++;
+}
+
 // uniforms belong to a program, so every program has to get the current weather state once after it changed
 static void GR_UploadSnow(PSXGPU_Shader* sh)
 {
@@ -1486,6 +1552,9 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	// blended primitives (glows, shadows) would turn into grey patches, so fog is only for opaque ones
 	if (sh->fogLoc != -1)
 		glUniform1f(sh->fogLoc, g_PreviousBlendMode == BM_NONE ? g_fogAmount : 0.0f);
+
+	if (sh->hfDensityLoc != -1)
+		glUniform1f(sh->hfDensityLoc, g_PreviousBlendMode == BM_NONE ? g_hfDensity : 0.0f);
 
 	// same for snow: car light reflections and shadows lie flat on the road and would turn into white squares
 	if (sh->snowLoc != -1)
@@ -1514,6 +1583,16 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	glUniform3fv(sh->snowGroundPosLoc, 1, g_snowGroundPos);
 	glUniform3fv(sh->snowGroundUpLoc, 1, g_snowGroundUp);
 	glUniform3fv(sh->fogColorLoc, 1, g_fogColor);
+
+	if (sh->hfFalloffLoc != -1)
+	{
+		glUniform1f(sh->hfFalloffLoc, g_hfFalloff);
+		glUniform3fv(sh->worldUpLoc, 1, g_worldUp);
+		glUniform1f(sh->camHeightLoc, g_camHeight);
+		glUniform3fv(sh->sunDirLoc, 1, g_sunDir);
+		glUniform3fv(sh->sunColorLoc, 1, g_sunColor);
+		glUniform1f(sh->sunScatterLoc, g_sunScatter);
+	}
 
 	if (sh->beamPosLoc != -1)
 	{

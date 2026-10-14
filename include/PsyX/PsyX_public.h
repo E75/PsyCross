@@ -99,6 +99,11 @@ extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
 extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, float density);
 extern void PsyX_SetVolumeBeam(float amount);
 
+/* Height fog on top of the distance fog: optical depth heightDensity * exp(-heightFalloff * height) per unit, height above
+   sea level (camHeight for the camera). worldUpView and sunDirView are unit vectors in view space (GTE units, y down);
+   sunScatter 0..1 turns the fog towards sunColor when looking into the sun. heightDensity 0 = off. */
+extern void PsyX_SetAtmosphere(float heightFalloff, float heightDensity, const float* worldUpView, float camHeight, const float* sunDirView, const float* sunColor, float sunScatter);
+
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
 
