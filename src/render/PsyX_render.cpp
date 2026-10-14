@@ -814,23 +814,35 @@ static const char* gpu_shader_snow = R"(
 		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
 		vec3 sum = vec3(0.0);
 
+		// street lamps and traffic lights light everything; the world has part of their light baked in, so it gets less
+		// than cars and pedestrians (modes 6 and 4)
+		float mode = v_view.w - 1.0;
+		float lampLit = (abs(mode - 6.0) < 0.5 || abs(mode - 4.0) < 0.5) ? 1.0 : 0.4;
+
 		// other cars: two lamps each, shorter reach than the player's beam, so a car right in front of them is lit most
 		for (int i = 0; i < 16; i++)
 		{
 			if (i >= u_lightCount || u_volDensity <= 0.0)
 				break;
 
-			if (dot(u_lightDir[i], u_lightDir[i]) < 0.25)
-				continue;
-
 			vec3 toLamp = u_lightPos[i] - p;
 			float lampDist = max(length(toLamp), 1.0);
 			vec3 ll = toLamp / lampDist;
+
+			if (dot(u_lightDir[i], u_lightDir[i]) < 0.25)
+			{
+				float reach = u_lightCol[i].w * 4.0;	// w is the halo, 0.12 of the light radius
+				float a = clamp(1.0 - lampDist / reach, 0.0, 1.0);
+				float facing = max((dot(n, ll) + 0.2) / 1.2, 0.0);
+				sum += u_lightCol[i].rgb * (a * a * facing * dark * lampLit * 0.7);
+				continue;
+			}
+
 			float lampCone = smoothstep(0.6, 0.9, dot(-ll, normalize(u_lightDir[i])));
 			float lampAtten = clamp(1.0 - lampDist / 7000.0, 0.0, 1.0);
-			lampAtten *= lampAtten * smoothstep(100.0, 600.0, lampDist);
+			lampAtten *= lampAtten * smoothstep(20.0, 150.0, lampDist);	// a car right beside the lamp is lit too
 			float wrap = max((dot(n, ll) + 0.35) / 1.35, 0.0);	// a roof or side at a grazing angle still catches some
-			sum += vec3(1.0, 0.92, 0.75) * (lampCone * lampAtten * wrap * dark * 0.8);
+			sum += vec3(1.0, 0.92, 0.75) * (lampCone * lampAtten * wrap * dark * 0.95);
 		}
 
 		if (u_beam <= 0.0)
@@ -841,7 +853,7 @@ static const char* gpu_shader_snow = R"(
 		vec3 l = toLight / dist;
 
 		float cone = smoothstep(0.80, 0.95, dot(-l, u_beamDir));
-		float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(300.0, 2500.0, dist);	// no hot spot right at the nose
+		float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(150.0, 900.0, dist);	// no hot spot right at the nose
 		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
 
 		// the road is lit at a grazing angle (ndl near 0.4), hence the gain
