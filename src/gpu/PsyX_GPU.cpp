@@ -9,6 +9,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GET_TPAGE_FORMAT(tpage) ((TexFormat)((tpage >> 7) & 0x3))
@@ -65,6 +66,84 @@ GPUDrawSplit g_splits[MAX_DRAW_SPLITS];
 int g_vertexIndex = 0;
 int g_vertexPeak = 0;	// most vertices of a frame, for the draw distance test log
 int g_splitIndex = 0;
+
+// objects that fade (PsyX_SetPrimFade): primitive memory ranges and their vertex alpha, until the next DrawOTag ends
+struct PrimFadeRange
+{
+	uintptr_t start, end;
+	u_char alpha;
+};
+
+static PrimFadeRange g_primFades[PSYX_MAX_PRIM_FADES];
+static int g_primFadeCount = 0;
+static int g_primFadeSorted = 1;
+
+void PsyX_SetPrimFade(void* start, void* end, float fade)
+{
+	if (fade >= 1.0f || (uintptr_t)start >= (uintptr_t)end || g_primFadeCount >= PSYX_MAX_PRIM_FADES)
+		return;
+
+	PrimFadeRange& r = g_primFades[g_primFadeCount];
+
+	r.start = (uintptr_t)start;
+	r.end = (uintptr_t)end;
+	r.alpha = (u_char)(fade > 0.0f ? fade * 254.0f : 0.0f);
+
+	if (g_primFadeCount > 0 && r.start < g_primFades[g_primFadeCount - 1].start)
+		g_primFadeSorted = 0;
+
+	g_primFadeCount++;
+}
+
+void ClearPrimFades()
+{
+	g_primFadeCount = 0;
+	g_primFadeSorted = 1;
+}
+
+static int ComparePrimFades(const void* a, const void* b)
+{
+	uintptr_t sa = ((const PrimFadeRange*)a)->start;
+	uintptr_t sb = ((const PrimFadeRange*)b)->start;
+
+	return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+// the vertices written for one primitive get the fade of the range that holds it
+static void ApplyPrimFade(uintptr_t prim, int firstVertex)
+{
+	int lo = 0, hi, found = -1;
+
+	if (g_primFadeCount == 0 || g_vertexIndex <= firstVertex)
+		return;
+
+	if (!g_primFadeSorted)
+	{
+		qsort(g_primFades, g_primFadeCount, sizeof(PrimFadeRange), ComparePrimFades);
+		g_primFadeSorted = 1;
+	}
+
+	// last range that starts at or before the primitive
+	hi = g_primFadeCount - 1;
+	while (lo <= hi)
+	{
+		int mid = (lo + hi) / 2;
+
+		if (g_primFades[mid].start <= prim)
+		{
+			found = mid;
+			lo = mid + 1;
+		}
+		else
+			hi = mid - 1;
+	}
+
+	if (found < 0 || prim >= g_primFades[found].end)
+		return;
+
+	for (int i = firstVertex; i < g_vertexIndex; i++)
+		g_vertexBuffer[i].a = g_primFades[found].alpha;
+}
 
 void ClearSplits()
 {
@@ -874,7 +953,10 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 				int primLength = 0;
 				while (currentPacket < endPacket)
 				{
+					const int firstVertex = g_vertexIndex;
+
 					primLength = ParsePrimitive(reinterpret_cast<P_TAG*>(currentPacket));
+					ApplyPrimFade(currentPacket, firstVertex);
 					currentPacket += (primLength + P_LEN) * sizeof(u_int);
 				}
 

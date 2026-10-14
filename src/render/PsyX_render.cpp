@@ -678,8 +678,9 @@ GLint u_texelSizeLoc;
 	"	void main() {\n"\
 	"		vec4 color = (bilinearFilter > 0) ? bilinearTextureSample(v_texcoord.xy) : nearestTextureSample(v_texcoord.xy);\n"\
 	"		vec4 base = applySnow(color, snowEdge());\n"\
-	"		vec4 lit = base * v_color;\n"\
+	"		vec4 lit = base * vec4(v_color.rgb, 1.0);\n"\
 	"		lit.rgb += base.rgb * beamLight();\n"\
+	"		objectFade();\n"\
 	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n"
 
@@ -689,6 +690,22 @@ static const char* gpu_shader_common = R"(
 	varying vec4 v_page_clut;
 	varying float v_z;
 	varying vec4 v_view;	// xy = view x, y / 128 / draw size - 0.5, z = view z / 128, w = 1 + snow mode for 3D (PGXP) geometry
+)";
+
+// A fading object (PsyX_SetPrimFade) carries its fade in the vertex alpha: an ordered 4x4 dither drops that share of its
+// pixels, so it needs no sorting and shows nothing through itself. Called last, after the screen space derivatives.
+static const char* gpu_shader_fade = R"(
+	float bayer2(vec2 a) { a = floor(a); return fract(a.x * 0.5 + a.y * a.y * 0.75); }
+
+	void objectFade() {
+		if (v_color.a < 0.999)
+		{
+			float t = bayer2(gl_FragCoord.xy * 0.5) * 0.25 + bayer2(gl_FragCoord.xy) + 0.5 / 16.0;
+
+			if (v_color.a < t)
+				discard;
+		}
+	}
 )";
 
 #if USE_PGXP && (defined(RENDERER_OGL) || (OGLES_VERSION == 3))
@@ -935,8 +952,9 @@ const char* gpu_shader_32_rgba =
 	"		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"\
 	"		vec4 color = texture2D(s_texture, tc);\n"\
 	"		vec4 base = applySnow(color, 0.0);\n"\
-	"		vec4 lit = base * v_color;\n"\
+	"		vec4 lit = base * vec4(v_color.rgb, 1.0);\n"\
 	"		lit.rgb += base.rgb * beamLight();\n"\
+	"		objectFade();\n"\
 	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n";
 
@@ -1098,6 +1116,7 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 		gpu_shader_common,
 		GPU_DITHERING,
 		gpu_shader_snow,
+		gpu_shader_fade,
 		source
 	};
 
@@ -1114,8 +1133,8 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 
 	const char** vs_list = isPsxShader ? vs_list_psx : vs_list_src;
 	const char** fs_list = isPsxShader ? fs_list_psx : fs_list_src;
-	const int vs_list_cnt = isPsxShader ? 4 : 3;
-	const int fs_list_cnt = isPsxShader ? 6 : 3;
+	const int vs_list_cnt = isPsxShader ? sizeof(vs_list_psx) / sizeof(vs_list_psx[0]) : sizeof(vs_list_src) / sizeof(vs_list_src[0]);
+	const int fs_list_cnt = isPsxShader ? sizeof(fs_list_psx) / sizeof(fs_list_psx[0]) : sizeof(fs_list_src) / sizeof(fs_list_src[0]);
 
 	GLuint program = glCreateProgram();
 

@@ -22,6 +22,7 @@ extern int g_GPUDisabledState;
 
 void ClearSplits();
 void DrawAllSplits();
+void ClearPrimFades();
 
 extern void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive);
 

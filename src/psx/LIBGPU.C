@@ -423,6 +423,7 @@ void DrawOTag(u_long* p)
 		if (g_GPUDisabledState)
 		{
 			ClearSplits();
+			ClearPrimFades();
 			return;
 		}
 
@@ -438,6 +439,9 @@ void DrawOTag(u_long* p)
 
 		DrawAllSplits();
 	} while (g_dbg_emulatorPaused);
+
+	// the fades belong to the primitives of this list (PsyX_SetPrimFade)
+	ClearPrimFades();
 }
  
 void DrawPrim(void* p)

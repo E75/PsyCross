@@ -101,6 +101,11 @@ extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
 extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, const float* dir, float density);
 extern void PsyX_SetVolumeBeam(float amount);
 
+/* An object that fades in or out: the primitives written to [start, end) of the primitive buffer get fade 0..1 (1 =
+   opaque), drawn as an ordered dither. Holds for the next DrawOTag only; ranges must not overlap. */
+#define PSYX_MAX_PRIM_FADES 1024
+extern void PsyX_SetPrimFade(void* start, void* end, float fade);
+
 /* Height fog on top of the distance fog: optical depth heightDensity * exp(-heightFalloff * height) per unit, height above
    sea level (camHeight for the camera). worldUpView and sunDirView are unit vectors in view space (GTE units, y down);
    sunScatter 0..1 turns the fog towards sunColor when looking into the sun. heightDensity 0 = off. */
