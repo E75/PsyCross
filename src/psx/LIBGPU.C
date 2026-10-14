@@ -811,6 +811,16 @@ void SetPsyXDebugMarker(DR_PSYX_DBGMARKER* p, const char* str)
 	p->text = str;
 }
 
+// sunX, sunY, horizonY in PSX screen pixels (may lie outside the screen), amount 0..255
+void SetPsyXSunShafts(DR_PSYX_SUNSHAFTS* p, int amount, int sunX, int sunY, int horizonY, int r, int g, int b)
+{
+	setlen(p, 4);
+	p->code[0] = 0xB3000000 | (amount & 0xFF);
+	p->code[1] = (u_short)sunX | ((u_int)(u_short)sunY << 16);
+	p->code[2] = (r & 0xFF) | (g & 0xFF) << 8 | (b & 0xFF) << 16;
+	p->code[3] = (u_short)horizonY;
+}
+
 u_long* BreakDraw(void)
 {
 	PSYX_UNIMPLEMENTED();

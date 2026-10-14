@@ -3,6 +3,7 @@
 #include "PsyX/PsyX_public.h"
 #include "PsyX/PsyX_globals.h"
 #include "PsyX/PsyX_render.h"
+#include "../render/PsyX_postfx.h"
 
 #include "../PsyX_main.h"
 
@@ -48,6 +49,12 @@ struct GPUDrawSplit
 	u_int			numVerts;
 
 	const char*		debugText;
+
+	int				sunShafts;		// 1 = no triangles, run the sun shafts post pass instead
+	int				shaftAmount;	// 0..255
+	float			shaftSun[2];	// sun position, screen mapped to -0.5..0.5 like the 2D vertices
+	float			shaftHorizonY;
+	float			shaftColor[3];
 };
 
 #define MAX_DRAW_SPLITS	 4096
@@ -743,6 +750,7 @@ static void AddSplit(bool semiTrans, bool textured)
 	split.drawenv = activeDrawEnv;
 	split.dispenv = activeDispEnv;
 	split.debugText = currentSplitDebugText;
+	split.sunShafts = 0;
 
 	split.drawenv.tw.w = overrideTextureWidth;
 	split.drawenv.tw.h = overrideTextureHeight;
@@ -755,6 +763,13 @@ void DrawSplit(const GPUDrawSplit& split)
 {
 	if(split.debugText)
 		GR_PushDebugLabel(split.debugText);
+
+	if (split.sunShafts)
+	{
+		if (split.drawenv.dfe)
+			PsyX_PostFx_SunShafts(split.shaftAmount, split.shaftSun[0], split.shaftSun[1], split.shaftHorizonY, split.shaftColor);
+		return;
+	}
 
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
@@ -1553,6 +1568,40 @@ static int ProcessPsyXPrims(P_TAG* polyTag)
 		DR_PSYX_DBGMARKER* psydbg = (DR_PSYX_DBGMARKER*)polyTag;
 		currentSplitDebugText = psydbg->text;
 		return 2;
+	}
+	case 0x03:
+	{
+		// sun shafts get a split of their own so they run between the scene drawn so far and what follows
+		DR_PSYX_SUNSHAFTS* shafts = (DR_PSYX_SUNSHAFTS*)polyTag;
+		GPUDrawSplit& curSplit = g_splits[g_splitIndex];
+		curSplit.numVerts = g_vertexIndex - curSplit.startVertex;
+
+		if (g_splitIndex + 1 >= MAX_DRAW_SPLITS)
+			return 4;
+
+		float w, h;
+		DrawEnvDimensions(w, h);
+
+		GPUDrawSplit& split = g_splits[++g_splitIndex];
+		split.blendMode = BM_NONE;
+		split.texFormat = (TexFormat)0xFFFF;	// the next primitive always starts a new split
+		split.textureId = 0;
+		split.drawPrimMode = g_DrawPrimMode;
+		split.drawenv = activeDrawEnv;
+		split.dispenv = activeDispEnv;
+		split.debugText = nullptr;
+		split.startVertex = g_vertexIndex;
+		split.numVerts = 0;
+
+		split.sunShafts = 1;
+		split.shaftAmount = shafts->code[0] & 0xFF;
+		split.shaftSun[0] = (short)(shafts->code[1] & 0xFFFF) / w - 0.5f;
+		split.shaftSun[1] = (short)(shafts->code[1] >> 16) / h - 0.5f;
+		split.shaftHorizonY = (short)(shafts->code[3] & 0xFFFF) / h - 0.5f;
+		split.shaftColor[0] = (shafts->code[2] & 0xFF) / 255.0f;
+		split.shaftColor[1] = (shafts->code[2] >> 8 & 0xFF) / 255.0f;
+		split.shaftColor[2] = (shafts->code[2] >> 16 & 0xFF) / 255.0f;
+		return 4;
 	}
 	}
 

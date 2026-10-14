@@ -702,6 +702,14 @@ typedef struct {
 	const char* text;
 } DR_PSYX_DBGMARKER;
 
+// screen space god rays from the sun, drawn over everything already in the frame
+typedef struct {
+	DECLARE_P_ADDR
+	u_int  code[4];
+} DR_PSYX_SUNSHAFTS;
+
+static_assert(sizeof(DR_PSYX_SUNSHAFTS) / 4 - P_LEN == 4, "DR_PSYX_SUNSHAFTS size must be 4 longs");
+
 /*
  * Environment
  */
@@ -911,6 +919,7 @@ extern void GetDrawEnv2(DR_ENV *p);
 
 extern void SetPsyXTexture(DR_PSYX_TEX *p, uint grTextureId, int width, int height);
 extern void SetPsyXDebugMarker(DR_PSYX_DBGMARKER* p, const char* str);
+extern void SetPsyXSunShafts(DR_PSYX_SUNSHAFTS* p, int amount, int sunX, int sunY, int horizonY, int r, int g, int b);
 
 #ifdef _DEBUG
 #define PSYX_DBG_MARKER_TEXT(primptr, ot, text) \
