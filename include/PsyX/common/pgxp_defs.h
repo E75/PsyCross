@@ -7,6 +7,11 @@
 #include "PsyX/common/half_float.h"
 
 // Helpful macro
+
+// vertices of one frame: a 10x draw distance with many cars transforms more than 65536, and with a 16 bit index the
+// cache wrapped and the last drawn models (the cars) lost their precise positions; the index is 24 bit in the prim tag
+#define PGXP_CACHE_SIZE		(1 << 18)
+#define PGXP_INVALID_INDEX	0xFFFFFF
 #define PGXP_LOOKUP_VALUE(x, y) (*(u_short*)&(x) | (*(u_short*)&(y) << 16))
 
 //-------------------------------------
@@ -46,16 +51,16 @@ extern PGXPVector3D g_FP_SXYZ2;
 void	PGXP_ClearCache();
 
 /* emits new PGXP vertex */
-ushort	PGXP_EmitCacheData(PGXPVData* newData);
+uint	PGXP_EmitCacheData(PGXPVData* newData);
 
 /* sets Z offset (works like Z bias) */
 void	PGXP_SetZOffsetScale(float offset, float scale);
 
 /* searches for vertex with given lookup value */
-int		PGXP_GetCacheData(PGXPVData* out, uint lookup, ushort indexhint /* = 0xFFFF */);
+int		PGXP_GetCacheData(PGXPVData* out, uint lookup, uint indexhint /* = PGXP_INVALID_INDEX */);
 
 /* used by primitive setup */
-ushort	PGXP_GetIndex(int checkTransform);
+uint	PGXP_GetIndex(int checkTransform);
 
 #if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
 }

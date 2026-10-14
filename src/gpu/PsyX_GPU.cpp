@@ -217,7 +217,7 @@ void LineSwapSourceVerts(VERTTYPE*& p0, VERTTYPE*& p1, unsigned char*& c0, unsig
 	}
 }
 
-void MakeLineArray(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, ushort gteidx)
+void MakeLineArray(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, uint gteidx)
 {
 	const VERTTYPE dx = p1[0] - p0[0];
 	const VERTTYPE dy = p1[1] - p0[1];
@@ -263,13 +263,13 @@ void MakeLineArray(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, ushort gteidx)
 	ScreenCoordsToEmulator(vertex, 4);
 }
 
-inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, ushort gteidx, int lookupOfs)
+inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, uint gteidx, int lookupOfs)
 {
 #if USE_PGXP
 	uint lookup = PGXP_LOOKUP_VALUE(p[0], p[1]);
 
 	PGXPVData vd;
-	if (gteidx != 0xffff &&
+	if (gteidx < PGXP_INVALID_INDEX &&
 		g_cfg_pgxpTextureCorrection && 
 		PGXP_GetCacheData(&vd, lookup, gteidx + lookupOfs))
 	{
@@ -309,7 +309,7 @@ inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, us
 #endif
 }
 
-void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, ushort gteidx)
+void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, uint gteidx)
 {
 	assert(p0);
 	assert(p1);
@@ -336,7 +336,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	ScreenCoordsToEmulator(vertex, 3);
 }
 
-void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, VERTTYPE* p3, ushort gteidx)
+void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, VERTTYPE* p3, uint gteidx)
 {
 	assert(p0);
 	assert(p1);
@@ -368,7 +368,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	ScreenCoordsToEmulator(vertex, 4);
 }
 
-void MakeVertexRect(GrVertex* vertex, VERTTYPE* p0, short w, short h, ushort gteidx)
+void MakeVertexRect(GrVertex* vertex, VERTTYPE* p0, short w, short h, uint gteidx)
 {
 	assert(p0);
 
@@ -928,7 +928,7 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 		P_TAG* polyTag = reinterpret_cast<P_TAG*>(p);
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
 		// force PGXP off
-		polyTag->pgxp_index = 0xFFFF;
+		polyTag->pgxp_index = PGXP_INVALID_INDEX;
 #endif
 		ParsePrimitive(polyTag);
 
@@ -988,7 +988,7 @@ inline int IsNull(POLY_FT3* poly)
 static int ProcessFlatLines(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1149,7 +1149,7 @@ static int ProcessFlatLines(P_TAG* polyTag)
 static int ProcessGouraudLines(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1203,7 +1203,7 @@ static int ProcessGouraudLines(P_TAG* polyTag)
 static int ProcessFlatPoly(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1302,7 +1302,7 @@ static int ProcessFlatPoly(P_TAG* polyTag)
 static int ProcessGouraudPoly(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1398,7 +1398,7 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
 static int ProcessTileAndSprt(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif

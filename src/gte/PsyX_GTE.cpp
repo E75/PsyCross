@@ -284,8 +284,8 @@ PGXPVector3D g_FP_SXYZ0; // direct access PGXP without table lookup
 PGXPVector3D g_FP_SXYZ1;
 PGXPVector3D g_FP_SXYZ2;
 
-PGXPVData g_pgxpCache[1 << sizeof(ushort)*8];
-ushort g_pgxpVertexIndex = 0;
+PGXPVData g_pgxpCache[PGXP_CACHE_SIZE];
+uint g_pgxpVertexIndex = 0;
 
 int g_pgxpTransformed = 0;
 
@@ -298,7 +298,7 @@ void PGXP_ClearCache()
 	g_pgxpVertexIndex = 0;
 }
 
-ushort PGXP_GetIndex(int checkTransform)
+uint PGXP_GetIndex(int checkTransform)
 {
 	if (!checkTransform || g_pgxpTransformed)
 	{
@@ -307,15 +307,15 @@ ushort PGXP_GetIndex(int checkTransform)
 		return g_pgxpVertexIndex;
 	}
 
-	return 0xFFFF;
+	return PGXP_INVALID_INDEX;
 }
 
-ushort PGXP_EmitCacheData(PGXPVData* newData)
+uint PGXP_EmitCacheData(PGXPVData* newData)
 {
-	ushort nextIndex = g_pgxpVertexIndex++;
+	// wraps round within the cache, so the index stays below PGXP_INVALID_INDEX
+	uint nextIndex = g_pgxpVertexIndex;
 
-	if (nextIndex == 0xffff)
-		return 0xffff;
+	g_pgxpVertexIndex = (g_pgxpVertexIndex + 1) & (PGXP_CACHE_SIZE - 1);
 
 	g_pgxpCache[nextIndex] = *newData;
 	g_pgxpTransformed = 1;
@@ -329,9 +329,9 @@ void PGXP_SetZOffsetScale(float offset, float scale)
 }
 
 // sets copy of cached vertex data to out
-int PGXP_GetCacheData(PGXPVData* out, uint lookup, ushort indexhint)
+int PGXP_GetCacheData(PGXPVData* out, uint lookup, uint indexhint)
 {
-	if (indexhint == 0xFFFF)
+	if (indexhint >= PGXP_INVALID_INDEX)
 	{
 		out->px = 0.0f;
 		out->py = 0.0f;
@@ -343,22 +343,19 @@ int PGXP_GetCacheData(PGXPVData* out, uint lookup, ushort indexhint)
 	}
 
 	// index hint allows us to start from specific index
-	ushort index = max(0, int(indexhint) - 8);
+	uint index = (indexhint - 8u) & (PGXP_CACHE_SIZE - 1);
 
 	for(int i = 0; i < 512; i++)
 	{
-		if (index == 0xffff)
-			index++;
-
 		if (g_pgxpCache[index].lookup == lookup)
 		{
 			if (i > 256)
-				PsyX_Log_Warning("PGXP_GetCacheData lookup IS inefficient: hint: %d, start: %d, found: %d, cycles: %d\n", indexhint, ushort(indexhint - 8u), index, i);
+				PsyX_Log_Warning("PGXP_GetCacheData lookup IS inefficient: hint: %d, found: %d, cycles: %d\n", indexhint, index, i);
 
 			*out = g_pgxpCache[index];
 			return 1;
 		}
-		index++;
+		index = (index + 1) & (PGXP_CACHE_SIZE - 1);
 	}
 
 	//PsyX_Log_Warning("PGXP_GetCacheData lookup IS NOT FOUND: hint: %d\n", indexhint);
