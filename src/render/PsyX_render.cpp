@@ -669,9 +669,15 @@ GLint u_texelSizeLoc;
 	"		return t;\n"\
 	"	}\n"\
 	"	uniform int bilinearFilter;\n"\
+	"	float snowEdge() {\n"\
+	"		if (abs(v_view.w - 6.0) > 0.5) { return 0.0; }\n"\
+	"		vec2 a = samplePSX(floor(v_texcoord.xy) - vec2(0.0, 1.0));\n"\
+	"		vec2 b = samplePSX(floor(v_texcoord.xy) - vec2(0.0, 3.0));\n"\
+	"		return (a.x + a.y == 0.0 || b.x + b.y == 0.0) ? 1.0 : 0.0;\n"\
+	"	}\n"\
 	"	void main() {\n"\
 	"		vec4 color = (bilinearFilter > 0) ? bilinearTextureSample(v_texcoord.xy) : nearestTextureSample(v_texcoord.xy);\n"\
-	"		vec4 base = applySnow(color);\n"\
+	"		vec4 base = applySnow(color, snowEdge());\n"\
 	"		vec4 lit = base * v_color;\n"\
 	"		lit.rgb += base.rgb * beamLight();\n"\
 	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
@@ -682,39 +688,54 @@ static const char* gpu_shader_common = R"(
 	varying vec4 v_color;
 	varying vec4 v_page_clut;
 	varying float v_z;
-	varying vec4 v_view;	// xyz = view space position / 128, w = 1 for 3D (PGXP) geometry
+	varying vec4 v_view;	// xy = view x, y / 128 / draw size - 0.5, z = view z / 128, w = 1 + snow mode for 3D (PGXP) geometry
 )";
 
 #if USE_PGXP && (defined(RENDERER_OGL) || (OGLES_VERSION == 3))
-// Snow on the road: faces that point up (normal from screen space derivatives of the view space position) and lie near
-// the road level (both given by the game in view space). The layer is closed and white, switched on at once.
+// Weather snow on faces that point up (normal from screen space derivatives of the view space position). The snow mode
+// of the polygon (game tpage bits 13-15, draw.h SNOW_TPAGE_*) says where: ground tiles everywhere, other models only near
+// the road level under the camera (pavements), cars a light dusting, tree sprites on the top edges of their leaves.
 static const char* gpu_shader_snow = R"(
 	uniform float u_snow;
 	uniform vec3 u_groundPos;
 	uniform vec3 u_groundUp;
+	uniform vec2 u_viewScale;	// draw size * 128: v_view.xy hold view x, y / 128 / draw size - 0.5 (ScreenCoordsToEmulator)
 
-	vec4 applySnow(vec4 color) {
-		vec3 p = v_view.xyz * 128.0;
+	// edge = 1 when the texel above this one is transparent (top of a leaf), see main
+	vec4 applySnow(vec4 color, float edge) {
+		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
 		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
 		float len = length(n);
+		float mode = v_view.w - 1.0;
 
-		if (u_snow <= 0.0 || v_view.w < 0.5 || (v_view.w > 1.5 && v_view.w < 2.5) || len < 0.0001)	// w = 2: no snow at all
+		if (u_snow <= 0.0 || v_view.w < 0.5 || abs(mode - 4.0) < 0.5 || len < 0.0001)	// mode 4: no snow at all
 			return color;
 
 		n /= len;
 		if (dot(n, p) > 0.0)
 			n = -n;		// face the camera
 
-		// only the road: (almost) horizontal faces within ~2 m of the road level, no roofs and no walls
 		float up = dot(n, u_groundUp);
-		float height = abs(dot(p - u_groundPos, u_groundUp));
-		float snow = smoothstep(0.8, 0.95, up) * (1.0 - smoothstep(250.0, 400.0, height)) * u_snow;
+		float lum = dot(color.rgb, vec3(0.3, 0.59, 0.11));
+		float snow;
 
-		color.rgb = mix(color.rgb, vec3(0.93, 0.95, 1.0), snow);
+		if (abs(mode - 2.0) < 0.5)
+			snow = smoothstep(0.55, 0.75, up) * 0.92;	// ground tile: every road, also far away and up a hill
+		else if (abs(mode - 6.0) < 0.5)
+			snow = smoothstep(0.85, 0.97, up) * 0.45;	// car: roof, bonnet and boot only, the lamps stay clear
+		else if (abs(mode - 5.0) < 0.5)
+			snow = max(edge * 0.6, smoothstep(0.3, 0.6, lum) * 0.35);	// billboard sprite (tree): leaf tops and the sunlit leaves
+		else
+		{
+			// other models: horizontal faces within ~2 m of the road level, no roofs and no walls
+			float height = abs(dot(p - u_groundPos, u_groundUp));
+			snow = smoothstep(0.8, 0.95, up) * (1.0 - smoothstep(250.0, 400.0, height)) * 0.92;
+		}
+
+		// the texture shimmers through a little, so the road keeps its cracks and patches
+		color.rgb = mix(color.rgb, vec3(0.90, 0.92, 0.96) * (0.88 + 0.24 * lum), snow * u_snow);
 		return color;
 	}
-
-	uniform vec2 u_viewScale;	// draw size * 128: v_view.xy hold view x, y / 128 / draw size - 0.5 (ScreenCoordsToEmulator)
 
 	// applied after the vertex lighting. Falls off with the square of the distance so the near street stays clear.
 	uniform float u_fog;
@@ -885,7 +906,7 @@ static const char* gpu_shader_snow = R"(
 )";
 #else
 static const char* gpu_shader_snow = R"(
-	vec4 applySnow(vec4 color) { return color; }
+	vec4 applySnow(vec4 color, float edge) { return color; }
 	vec4 applyFog(vec4 color) { return color; }
 	vec3 beamLight() { return vec3(0.0); }
 	vec3 volumeLight() { return vec3(0.0); }
@@ -901,7 +922,7 @@ const char* gpu_shader_32_rgba =
 	"	void main() {\n"\
 	"		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"\
 	"		vec4 color = texture2D(s_texture, tc);\n"\
-	"		vec4 base = applySnow(color);\n"\
+	"		vec4 base = applySnow(color, 0.0);\n"\
 	"		vec4 lit = base * v_color;\n"\
 	"		lit.rgb += base.rgb * beamLight();\n"\
 	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
@@ -917,7 +938,7 @@ const char* gpu_shader_32_rgba =
 		"	vec2 geom_ofs = vec2(0.5, 0.5);\n"\
 		"	vec4 fragPosition = (a_zw.y > 100.0 ? ofsMat * (Projection3D * vec4((a_position.xy + geom_ofs) * vec2(1.0,-1.0) * a_zw.y, a_zw.x, 1.0)) : (Projection * vec4(a_position.xy, 0.5, 1.0)));\n" \
 		"	gl_Position = fragPosition;\n"\
-		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, a_texcoord.w > 1.5 ? 2.0 : 1.0) : vec4(0.0);\n"
+		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, 1.0 + floor(a_texcoord.w * 0.5)) : vec4(0.0);\n"
 #else
 #	define GTE_PERSPECTIVE_CORRECTION \
 		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"\
