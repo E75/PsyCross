@@ -93,6 +93,12 @@ extern void PsyX_SetFog(float amount, const float* color);
 /* Headlight cone of the player car, position and direction in view space (GTE units), amount 0..1 */
 extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
 
+/* Lamps that light the air (halos, also in front of walls): pos = count * 3 floats in view space like PsyX_SetBeam,
+   color = count * 4 floats (rgb 0..1, radius), density 0 = off. amount = in-scattering of the headlight cone. */
+#define PSYX_MAX_VOLUME_LIGHTS 16
+extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, float density);
+extern void PsyX_SetVolumeBeam(float amount);
+
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
 

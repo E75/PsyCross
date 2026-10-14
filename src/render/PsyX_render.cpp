@@ -87,6 +87,12 @@ static float g_fogColor[3] = { 0.7f, 0.7f, 0.7f };
 static float g_beamAmount = 0.0f;
 static float g_beamPos[3] = { 0, 0, 0 };
 static float g_beamDir[3] = { 0, 0, 1 };
+// lamps and the headlight cone scattering in the air, see volumeLight in gpu_shader_snow
+static int g_volLightCount = 0;
+static float g_volLightPos[PSYX_MAX_VOLUME_LIGHTS * 3];
+static float g_volLightCol[PSYX_MAX_VOLUME_LIGHTS * 4];
+static float g_volDensity = 0.0f;
+static float g_beamVolume = 0.0f;
 
 int g_cfg_pgxpTextureCorrection = 1;
 int g_cfg_pgxpZBuffer = 1;
@@ -515,6 +521,12 @@ typedef struct
 	GLint beamLoc;
 	GLint beamPosLoc;
 	GLint beamDirLoc;
+	GLint lightCountLoc;
+	GLint lightPosLoc;
+	GLint lightColLoc;
+	GLint volDensityLoc;
+	GLint beamVolumeLoc;
+	GLint viewScaleLoc;
 #endif
 	int snowSerial;		// last g_snowSerial uploaded to this program
 } PSXGPU_Shader;
@@ -642,7 +654,7 @@ GLint u_texelSizeLoc;
 	"		vec4 base = applySnow(color);\n"\
 	"		vec4 lit = base * v_color;\n"\
 	"		lit.rgb += base.rgb * beamLight();\n"\
-	"		fragColor = dither(applyFog(lit));\n"\
+	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n"
 
 static const char* gpu_shader_common = R"(
@@ -699,8 +711,10 @@ static const char* gpu_shader_snow = R"(
 	uniform vec3 u_beamPos;
 	uniform vec3 u_beamDir;
 
+	uniform vec2 u_viewScale;	// draw size * 128: v_view.xy hold view x, y / 128 / draw size - 0.5 (ScreenCoordsToEmulator)
+
 	vec3 beamLight() {
-		vec3 p = v_view.xyz * 128.0;
+		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
 		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
 		float len = length(n);
 
@@ -720,7 +734,69 @@ static const char* gpu_shader_snow = R"(
 		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
 		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
 
-		return vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * atten * ndl * dark);
+		// the road is lit at a grazing angle (ndl near 0.4), hence the gain
+		return vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
+	}
+
+	// Light scattered by the air between the camera and the pixel: point lights (closed form of the integral of
+	// 1 / (d^2 + k) along the ray) and the headlight cone (marched). Added after the fog, so it lies on top of it.
+	uniform int u_lightCount;
+	uniform vec3 u_lightPos[16];
+	uniform vec4 u_lightCol[16];	// rgb, w = radius
+	uniform float u_volDensity;
+	uniform float u_beamVolume;
+
+	vec3 volumeLight() {
+		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
+		float t = length(p);
+
+		if (v_view.w < 0.5 || t < 1.0 || (u_volDensity <= 0.0 && u_beamVolume <= 0.0))
+			return vec3(0.0);
+
+		vec3 r = p / t;
+		vec3 sum = vec3(0.0);
+
+		for (int i = 0; i < 16; i++)
+		{
+			if (i >= u_lightCount)
+				break;
+
+			vec3 L = u_lightPos[i];
+			float radius = u_lightCol[i].w;	// halo radius
+			float k = radius * 0.1;			// core size: no infinite hot spot when the ray passes through the lamp
+			float b = dot(L, r);
+			float miss2 = max(dot(L, L) - b * b, 0.0);	// squared distance of the ray from the lamp
+			float h = sqrt(miss2 + k * k);
+			float scat = (atan((t - b) / h) - atan(-b / h)) * k / h;	// pi at the core
+			// only rays that pass the lamp within its halo, and no lamp whose halo holds the camera (it would tint the whole view)
+			float dist = length(L);
+			float reach = (1.0 - smoothstep(radius * 0.5, radius, sqrt(miss2))) * smoothstep(radius, radius * 3.0, dist) * (1.0 - smoothstep(12000.0, 24000.0, dist));
+
+			sum += u_lightCol[i].rgb * (scat * reach);
+		}
+
+		sum *= u_volDensity * 0.08;
+
+		if (u_beamVolume > 0.0 && u_beam > 0.0)
+		{
+			float seg = min(t, 9000.0);
+			float beam = 0.0;
+
+			for (int j = 0; j < 8; j++)
+			{
+				vec3 s = r * (seg * (float(j) + 0.5) / 8.0);
+				vec3 toLight = u_beamPos - s;
+				float dist = max(length(toLight), 1.0);
+				float cone = smoothstep(0.80, 0.95, dot(-toLight / dist, u_beamDir));
+				float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(300.0, 2500.0, dist);
+				beam += cone * atten * atten;
+			}
+
+			// sum of the samples times the step length: a wall right in front of the car gets little haze
+			sum += vec3(1.0, 0.92, 0.75) * (beam * seg / (8.0 * 9000.0) * u_beam * u_beamVolume * 0.15);
+		}
+
+		return sum;
 	}
 )";
 #else
@@ -728,6 +804,7 @@ static const char* gpu_shader_snow = R"(
 	vec4 applySnow(vec4 color) { return color; }
 	vec4 applyFog(vec4 color) { return color; }
 	vec3 beamLight() { return vec3(0.0); }
+	vec3 volumeLight() { return vec3(0.0); }
 )";
 #endif
 
@@ -743,7 +820,7 @@ const char* gpu_shader_32_rgba =
 	"		vec4 base = applySnow(color);\n"\
 	"		vec4 lit = base * v_color;\n"\
 	"		lit.rgb += base.rgb * beamLight();\n"\
-	"		fragColor = dither(applyFog(lit));\n"\
+	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n";
 
 #if USE_PGXP
@@ -1043,6 +1120,12 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->beamLoc = glGetUniformLocation(sh->shader, "u_beam");
 	sh->beamPosLoc = glGetUniformLocation(sh->shader, "u_beamPos");
 	sh->beamDirLoc = glGetUniformLocation(sh->shader, "u_beamDir");
+	sh->lightCountLoc = glGetUniformLocation(sh->shader, "u_lightCount");
+	sh->lightPosLoc = glGetUniformLocation(sh->shader, "u_lightPos[0]");
+	sh->lightColLoc = glGetUniformLocation(sh->shader, "u_lightCol[0]");
+	sh->volDensityLoc = glGetUniformLocation(sh->shader, "u_volDensity");
+	sh->beamVolumeLoc = glGetUniformLocation(sh->shader, "u_beamVolume");
+	sh->viewScaleLoc = glGetUniformLocation(sh->shader, "u_viewScale");
 	sh->snowSerial = 0;
 #if USE_PGXP
 	sh->projection3DLoc = glGetUniformLocation(sh->shader, "Projection3D");
@@ -1375,6 +1458,23 @@ void PsyX_SetBeam(float amount, const float* pos, const float* dir)
 	g_snowSerial++;
 }
 
+void PsyX_SetVolumeLights(int count, const float* pos, const float* color, float density)
+{
+	if (count > PSYX_MAX_VOLUME_LIGHTS)
+		count = PSYX_MAX_VOLUME_LIGHTS;
+
+	g_volLightCount = count > 0 ? count : 0;
+	memcpy(g_volLightPos, pos, sizeof(float) * 3 * g_volLightCount);
+	memcpy(g_volLightCol, color, sizeof(float) * 4 * g_volLightCount);
+	g_volDensity = g_volLightCount > 0 ? density : 0.0f;
+	g_snowSerial++;
+}
+
+void PsyX_SetVolumeBeam(float amount)
+{
+	g_beamVolume = amount;
+}
+
 // uniforms belong to a program, so every program has to get the current weather state once after it changed
 static void GR_UploadSnow(PSXGPU_Shader* sh)
 {
@@ -1390,6 +1490,18 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	// same for snow: car light reflections and shadows lie flat on the road and would turn into white squares
 	if (sh->snowLoc != -1)
 		glUniform1f(sh->snowLoc, g_PreviousBlendMode == BM_NONE ? g_snowAmount : 0.0f);
+
+	// the air in front of a glow sprite or a shadow is already lit by the opaque geometry behind it
+	if (sh->volDensityLoc != -1)
+	{
+		glUniform1f(sh->volDensityLoc, g_PreviousBlendMode == BM_NONE ? g_volDensity : 0.0f);
+		glUniform1f(sh->beamVolumeLoc, g_PreviousBlendMode == BM_NONE ? g_beamVolume : 0.0f);
+
+		if (activeDrawEnv.dfe)
+			glUniform2f(sh->viewScaleLoc, activeDispEnv.disp.w * 128.0f, activeDispEnv.disp.h * 128.0f);
+		else
+			glUniform2f(sh->viewScaleLoc, activeDrawEnv.clip.w * 128.0f, activeDrawEnv.clip.h * 128.0f);
+	}
 
 	if (sh->snowSerial == g_snowSerial)
 		return;
@@ -1408,6 +1520,16 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 		glUniform3fv(sh->beamPosLoc, 1, g_beamPos);
 		glUniform3fv(sh->beamDirLoc, 1, g_beamDir);
 	}
+
+	if (sh->lightCountLoc != -1)
+	{
+		glUniform1i(sh->lightCountLoc, g_volLightCount);
+
+		if (g_volLightCount > 0)
+		{
+			glUniform3fv(sh->lightPosLoc, g_volLightCount, g_volLightPos);
+			glUniform4fv(sh->lightColLoc, g_volLightCount, g_volLightCol);
+		}	}
 #endif
 }
 
