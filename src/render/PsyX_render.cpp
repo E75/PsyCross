@@ -679,7 +679,7 @@ GLint u_texelSizeLoc;
 	"		vec4 color = (bilinearFilter > 0) ? bilinearTextureSample(v_texcoord.xy) : nearestTextureSample(v_texcoord.xy);\n"\
 	"		vec4 base = applySnow(color, snowEdge());\n"\
 	"		vec4 lit = base * vec4(v_color.rgb, 1.0);\n"\
-	"		lit.rgb += base.rgb * beamLight();\n"\
+	"		lit.rgb += beamLight(base.rgb);\n"\
 	"		objectFade();\n"\
 	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n"
@@ -816,7 +816,9 @@ static const char* gpu_shader_snow = R"(
 	uniform vec3 u_beamPos;
 	uniform vec3 u_beamDir;
 
-	vec3 beamLight() {
+	// surf = the colour of the surface (the caller's base). The lamps keep it, the headlight cone gets at least half of
+	// white as its albedo, else a dark night texture (a wall, a black car) swallows the cone and stays unlit.
+	vec3 beamLight(vec3 surf) {
 		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
 		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
 		float len = length(n);
@@ -867,7 +869,7 @@ static const char* gpu_shader_snow = R"(
 		}
 
 		if (u_beam <= 0.0)
-			return sum;
+			return sum * surf;
 
 		vec3 toLight = u_beamPos - p;
 		float dist = max(length(toLight), 1.0);
@@ -878,7 +880,7 @@ static const char* gpu_shader_snow = R"(
 		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
 
 		// the road is lit at a grazing angle (ndl near 0.4), hence the gain
-		return sum + vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
+		return sum * surf + mix(surf, vec3(1.0), 0.5) * vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
 	}
 
 	// Light scattered by the air between the camera and the pixel: point lights (closed form of the integral of
@@ -941,7 +943,7 @@ static const char* gpu_shader_snow = R"(
 static const char* gpu_shader_snow = R"(
 	vec4 applySnow(vec4 color, float edge) { return color; }
 	vec4 applyFog(vec4 color) { return color; }
-	vec3 beamLight() { return vec3(0.0); }
+	vec3 beamLight(vec3 surf) { return vec3(0.0); }
 	vec3 volumeLight() { return vec3(0.0); }
 )";
 #endif
@@ -957,7 +959,7 @@ const char* gpu_shader_32_rgba =
 	"		vec4 color = texture2D(s_texture, tc);\n"\
 	"		vec4 base = applySnow(color, 0.0);\n"\
 	"		vec4 lit = base * vec4(v_color.rgb, 1.0);\n"\
-	"		lit.rgb += base.rgb * beamLight();\n"\
+	"		lit.rgb += beamLight(base.rgb);\n"\
 	"		objectFade();\n"\
 	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n";
