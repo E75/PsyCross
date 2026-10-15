@@ -848,10 +848,14 @@ static const char* gpu_shader_snow = R"(
 
 			if (dot(u_lightDir[i], u_lightDir[i]) < 0.25)
 			{
-				float reach = u_lightCol[i].w * 4.0;	// w is the halo, 0.12 of the light radius
+				// a siren (dir of length 0.4) has nothing baked into the world: it lights the road and the walls around
+				// it in a wide circle, also at a grazing angle
+				float ground = clamp(length(u_lightDir[i]) * 2.5, 0.0, 1.0);
+				float reach = u_lightCol[i].w * (4.0 + ground * 1.5);	// w is the halo, 0.12 of the light radius
 				float a = clamp(1.0 - lampDist / reach, 0.0, 1.0);
-				float facing = max((dot(n, ll) + 0.2) / 1.2, 0.0);
-				sum += u_lightCol[i].rgb * (a * a * facing * dark * lampLit * 0.7);
+				float facing = max((dot(n, ll) + 0.2 + ground * 0.4) / (1.2 + ground * 0.4), 0.0);
+				float lit = mix(lampLit, lampLit > 0.5 ? 1.0 : 2.0, ground);
+				sum += u_lightCol[i].rgb * (a * a * facing * dark * lit * 0.7);
 				continue;
 			}
 
