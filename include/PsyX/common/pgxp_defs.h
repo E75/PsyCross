@@ -10,7 +10,7 @@
 
 // vertices of one frame: a 10x draw distance with many cars transforms more than 65536, and with a 16 bit index the
 // cache wrapped and the last drawn models (the cars) lost their precise positions; the index is 24 bit in the prim tag
-#define PGXP_CACHE_SIZE		(1 << 18)
+#define PGXP_CACHE_SIZE		(1 << 20)	// a frame across a river sees the whole city: more than 262144 vertices wrapped the cache and the world drawn first lost its positions
 #define PGXP_INVALID_INDEX	0xFFFFFF
 #define PGXP_LOOKUP_VALUE(x, y) (*(u_short*)&(x) | (*(u_short*)&(y) << 16))
 

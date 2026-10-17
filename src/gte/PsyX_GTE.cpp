@@ -293,8 +293,15 @@ int g_pgxpTransformed = 0;
 float g_pgxpZOffset = 0.0f;
 float g_pgxpZScale = 1.0f;
 
+int g_pgxpEmitted = 0;		// vertices emitted since the last clear
+int g_pgxpPeak = 0;			// most vertices of one frame (debug log)
+
 void PGXP_ClearCache()
 {
+	if (g_pgxpEmitted > g_pgxpPeak)
+		g_pgxpPeak = g_pgxpEmitted;
+
+	g_pgxpEmitted = 0;
 	g_pgxpVertexIndex = 0;
 }
 
@@ -316,6 +323,7 @@ uint PGXP_EmitCacheData(PGXPVData* newData)
 	uint nextIndex = g_pgxpVertexIndex;
 
 	g_pgxpVertexIndex = (g_pgxpVertexIndex + 1) & (PGXP_CACHE_SIZE - 1);
+	g_pgxpEmitted++;
 
 	g_pgxpCache[nextIndex] = *newData;
 	g_pgxpTransformed = 1;
