@@ -100,6 +100,8 @@ extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
 #define PSYX_MAX_VOLUME_LIGHTS 16
 extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, const float* dir, float density);
 extern void PsyX_SetVolumeBeam(float amount);
+/* Lamp highlights and light pools on ground tiles: 0 = off, 0.15 = dry road, 1 = wet road */
+extern void PsyX_SetRoadSpec(float amount);
 
 /* An object that fades in or out: the primitives written to [start, end) of the primitive buffer get fade 0..1 (1 =
    opaque), drawn as an ordered dither. Holds for the next DrawOTag only; ranges must not overlap. */

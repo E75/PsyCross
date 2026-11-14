@@ -95,6 +95,7 @@ static float g_volLightCol[PSYX_MAX_VOLUME_LIGHTS * 4];
 static float g_volLightDir[PSYX_MAX_VOLUME_LIGHTS * 3];
 static float g_volDensity = 0.0f;
 static float g_beamVolume = 0.0f;
+static float g_roadSpec = 0.0f;
 // height fog and sun glow of the fog, see applyFog in gpu_shader_snow
 static float g_hfFalloff = 0.0f;
 static float g_hfDensity = 0.0f;
@@ -539,6 +540,7 @@ typedef struct
 	GLint lightDirLoc;
 	GLint volDensityLoc;
 	GLint beamVolumeLoc;
+	GLint roadSpecLoc;
 	GLint viewScaleLoc;
 	GLint hfFalloffLoc;
 	GLint hfDensityLoc;
@@ -810,6 +812,7 @@ static const char* gpu_shader_snow = R"(
 	uniform vec3 u_lightDir[16];	// headlight direction, 0 for a lamp
 	uniform float u_volDensity;
 	uniform float u_beamVolume;
+	uniform float u_roadSpec;	// 0 = off, 0.15 dry .. 1 wet: lamp highlights and pools on ground tiles
 
 	// Headlights: the cone of the player car and the cones of the other cars, added on top of the vertex lighting.
 	uniform float u_beam;
@@ -832,12 +835,16 @@ static const char* gpu_shader_snow = R"(
 
 		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
 		vec3 sum = vec3(0.0);
+		vec3 gloss = vec3(0.0);	// highlights of the lamps on the road, not tinted by the road colour
 
 		// street lamps and traffic lights light everything; the world has part of their light baked in, so it gets less
 		// than cars and pedestrians (modes 6 and 4)
 		float mode = v_view.w - 1.0;
 		float lampLit = (abs(mode - 6.0) < 0.5 || abs(mode - 4.0) < 0.5) ? 1.0 : 0.4;
-
+		bool roadSpec = u_roadSpec > 0.0 && abs(mode - 2.0) < 0.5;	// ground tile: lamp pools and highlights
+		if (roadSpec)
+			lampLit = 1.6;
+		vec3 viewDir = -p / max(length(p), 1.0);
 		// other cars: two lamps each, shorter reach than the player's beam, so a car right in front of them is lit most
 		for (int i = 0; i < 16; i++)
 		{
@@ -858,6 +865,19 @@ static const char* gpu_shader_snow = R"(
 				float facing = max((dot(n, ll) + 0.2 + ground * 0.4) / (1.2 + ground * 0.4), 0.0);
 				float lit = mix(lampLit, lampLit > 0.5 ? 1.0 : 2.0, ground);
 				sum += u_lightCol[i].rgb * (a * a * facing * dark * lit * 0.7);
+
+				if (roadSpec)
+				{
+					// mirror streak: narrow across the view, long towards the camera (like a lamp mirrored in a wet road);
+					// the wetter the road, the narrower and brighter
+					vec3 h = normalize(ll + viewDir);
+					vec3 across = normalize(cross(n, viewDir));
+					float lat = dot(h, across);
+					float spec = pow(max(dot(n, h), 0.0), mix(2.0, 8.0, u_roadSpec)) * exp(-lat * lat * mix(120.0, 1200.0, u_roadSpec));
+					float specReach = clamp(1.0 - lampDist / (u_lightCol[i].w * 14.0), 0.0, 1.0);
+					gloss += u_lightCol[i].rgb * (spec * specReach * u_roadSpec * dark * 3.0);
+				}
+
 				continue;
 			}
 
@@ -866,10 +886,21 @@ static const char* gpu_shader_snow = R"(
 			lampAtten *= lampAtten * smoothstep(20.0, 150.0, lampDist);	// a car right beside the lamp is lit too
 			float wrap = max((dot(n, ll) + 0.35) / 1.35, 0.0);	// a roof or side at a grazing angle still catches some
 			sum += vec3(1.0, 0.92, 0.75) * (lampCone * lampAtten * wrap * dark * 0.95);
+
+			if (roadSpec)
+			{
+				// a lamp mirrored in the road, whichever way its cone points: narrow across the view, long towards the camera
+				vec3 h = normalize(ll + viewDir);
+				float lat = dot(h, normalize(cross(n, viewDir)));
+				float spec = pow(max(dot(n, h), 0.0), mix(2.0, 8.0, u_roadSpec)) * exp(-lat * lat * mix(120.0, 1200.0, u_roadSpec));
+				float specReach = clamp(1.0 - lampDist / (u_lightCol[i].w * 14.0), 0.0, 1.0);
+				float highUp = smoothstep(150.0, 400.0, dot(toLamp, n));	// only lamps on a post: a car's headlights hang just above the road and made tall white spikes
+				gloss += vec3(1.0, 0.92, 0.75) * (highUp * spec * specReach * specReach * u_roadSpec * u_roadSpec * dark * 2.5);
+			}
 		}
 
 		if (u_beam <= 0.0)
-			return sum * surf;
+			return sum * surf + gloss;
 
 		vec3 toLight = u_beamPos - p;
 		float dist = max(length(toLight), 1.0);
@@ -880,7 +911,7 @@ static const char* gpu_shader_snow = R"(
 		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
 
 		// the road is lit at a grazing angle (ndl near 0.4), hence the gain
-		return sum * surf + mix(surf, vec3(1.0), 0.5) * vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
+		return sum * surf + gloss + mix(surf, vec3(1.0), 0.5) * vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
 	}
 
 	// Light scattered by the air between the camera and the pixel: point lights (closed form of the integral of
@@ -1270,6 +1301,7 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->lightDirLoc = glGetUniformLocation(sh->shader, "u_lightDir[0]");
 	sh->volDensityLoc = glGetUniformLocation(sh->shader, "u_volDensity");
 	sh->beamVolumeLoc = glGetUniformLocation(sh->shader, "u_beamVolume");
+	sh->roadSpecLoc = glGetUniformLocation(sh->shader, "u_roadSpec");
 	sh->viewScaleLoc = glGetUniformLocation(sh->shader, "u_viewScale");
 	sh->hfFalloffLoc = glGetUniformLocation(sh->shader, "u_hfFalloff");
 	sh->hfDensityLoc = glGetUniformLocation(sh->shader, "u_hfDensity");
@@ -1629,6 +1661,11 @@ void PsyX_SetVolumeBeam(float amount)
 	g_beamVolume = amount;
 }
 
+void PsyX_SetRoadSpec(float amount)
+{
+	g_roadSpec = amount;
+}
+
 void PsyX_SetAtmosphere(float heightFalloff, float heightDensity, const float* worldUpView, float camHeight, const float* sunDirView, const float* sunColor, float sunScatter)
 {
 	g_hfFalloff = heightFalloff;
@@ -1669,6 +1706,7 @@ static void GR_UploadSnow(PSXGPU_Shader* sh)
 	{
 		glUniform1f(sh->volDensityLoc, g_PreviousBlendMode == BM_NONE ? g_volDensity : 0.0f);
 		glUniform1f(sh->beamVolumeLoc, g_PreviousBlendMode == BM_NONE ? g_beamVolume : 0.0f);
+		glUniform1f(sh->roadSpecLoc, g_PreviousBlendMode == BM_NONE ? g_roadSpec : 0.0f);
 
 		if (activeDrawEnv.dfe)
 			glUniform2f(sh->viewScaleLoc, activeDispEnv.disp.w * 128.0f, activeDispEnv.disp.h * 128.0f);
