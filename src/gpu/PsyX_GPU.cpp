@@ -3,11 +3,13 @@
 #include "PsyX/PsyX_public.h"
 #include "PsyX/PsyX_globals.h"
 #include "PsyX/PsyX_render.h"
+#include "../render/PsyX_postfx.h"
 
 #include "../PsyX_main.h"
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GET_TPAGE_FORMAT(tpage) ((TexFormat)((tpage >> 7) & 0x3))
@@ -44,10 +46,16 @@ struct GPUDrawSplit
 
 	int				drawPrimMode;
 
-	u_short			startVertex;
-	u_short			numVerts;
+	u_int			startVertex;
+	u_int			numVerts;
 
 	const char*		debugText;
+
+	int				sunShafts;		// 1 = no triangles, run the sun shafts post pass instead
+	int				shaftAmount;	// 0..255
+	float			shaftSun[2];	// sun position, screen mapped to -0.5..0.5 like the 2D vertices
+	float			shaftHorizonY;
+	float			shaftColor[3];
 };
 
 #define MAX_DRAW_SPLITS	 4096
@@ -56,7 +64,86 @@ GrVertex g_vertexBuffer[MAX_VERTEX_BUFFER_SIZE];
 GPUDrawSplit g_splits[MAX_DRAW_SPLITS];
 
 int g_vertexIndex = 0;
+int g_vertexPeak = 0;	// most vertices of a frame, for the draw distance test log
 int g_splitIndex = 0;
+
+// objects that fade (PsyX_SetPrimFade): primitive memory ranges and their vertex alpha, until the next DrawOTag ends
+struct PrimFadeRange
+{
+	uintptr_t start, end;
+	u_char alpha;
+};
+
+static PrimFadeRange g_primFades[PSYX_MAX_PRIM_FADES];
+static int g_primFadeCount = 0;
+static int g_primFadeSorted = 1;
+
+void PsyX_SetPrimFade(void* start, void* end, float fade)
+{
+	if (fade >= 1.0f || (uintptr_t)start >= (uintptr_t)end || g_primFadeCount >= PSYX_MAX_PRIM_FADES)
+		return;
+
+	PrimFadeRange& r = g_primFades[g_primFadeCount];
+
+	r.start = (uintptr_t)start;
+	r.end = (uintptr_t)end;
+	r.alpha = (u_char)(fade > 0.0f ? fade * 254.0f : 0.0f);
+
+	if (g_primFadeCount > 0 && r.start < g_primFades[g_primFadeCount - 1].start)
+		g_primFadeSorted = 0;
+
+	g_primFadeCount++;
+}
+
+void ClearPrimFades()
+{
+	g_primFadeCount = 0;
+	g_primFadeSorted = 1;
+}
+
+static int ComparePrimFades(const void* a, const void* b)
+{
+	uintptr_t sa = ((const PrimFadeRange*)a)->start;
+	uintptr_t sb = ((const PrimFadeRange*)b)->start;
+
+	return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+// the vertices written for one primitive get the fade of the range that holds it
+static void ApplyPrimFade(uintptr_t prim, int firstVertex)
+{
+	int lo = 0, hi, found = -1;
+
+	if (g_primFadeCount == 0 || g_vertexIndex <= firstVertex)
+		return;
+
+	if (!g_primFadeSorted)
+	{
+		qsort(g_primFades, g_primFadeCount, sizeof(PrimFadeRange), ComparePrimFades);
+		g_primFadeSorted = 1;
+	}
+
+	// last range that starts at or before the primitive
+	hi = g_primFadeCount - 1;
+	while (lo <= hi)
+	{
+		int mid = (lo + hi) / 2;
+
+		if (g_primFades[mid].start <= prim)
+		{
+			found = mid;
+			lo = mid + 1;
+		}
+		else
+			hi = mid - 1;
+	}
+
+	if (found < 0 || prim >= g_primFades[found].end)
+		return;
+
+	for (int i = firstVertex; i < g_vertexIndex; i++)
+		g_vertexBuffer[i].a = g_primFades[found].alpha;
+}
 
 void ClearSplits()
 {
@@ -130,7 +217,7 @@ void LineSwapSourceVerts(VERTTYPE*& p0, VERTTYPE*& p1, unsigned char*& c0, unsig
 	}
 }
 
-void MakeLineArray(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, ushort gteidx)
+void MakeLineArray(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, uint gteidx)
 {
 	const VERTTYPE dx = p1[0] - p0[0];
 	const VERTTYPE dy = p1[1] - p0[1];
@@ -176,13 +263,13 @@ void MakeLineArray(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, ushort gteidx)
 	ScreenCoordsToEmulator(vertex, 4);
 }
 
-inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, ushort gteidx, int lookupOfs)
+inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, uint gteidx, int lookupOfs)
 {
 #if USE_PGXP
 	uint lookup = PGXP_LOOKUP_VALUE(p[0], p[1]);
 
 	PGXPVData vd;
-	if (gteidx != 0xffff &&
+	if (gteidx < PGXP_INVALID_INDEX &&
 		g_cfg_pgxpTextureCorrection && 
 		PGXP_GetCacheData(&vd, lookup, gteidx + lookupOfs))
 	{
@@ -194,8 +281,21 @@ inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, us
 		float dispW, dispH;
 		DrawEnvDimensions(dispW, dispH);
 
-		const float gteOfsX = fmodf(vd.ofx, dispW) - dispW * 0.5f;
-		const float gteOfsY = fmodf(vd.ofy, dispH) - dispH * 0.5f;
+		// the GTE offset and the draw size are the same for nearly every vertex of a frame: keep the last fmodf results
+		static float lastOfx = -1.0f, lastOfy = -1.0f, lastW = 0.0f, lastH = 0.0f, lastGteOfsX = 0.0f, lastGteOfsY = 0.0f;
+
+		if (vd.ofx != lastOfx || vd.ofy != lastOfy || dispW != lastW || dispH != lastH)
+		{
+			lastOfx = vd.ofx;
+			lastOfy = vd.ofy;
+			lastW = dispW;
+			lastH = dispH;
+			lastGteOfsX = fmodf(vd.ofx, dispW) - dispW * 0.5f;
+			lastGteOfsY = fmodf(vd.ofy, dispH) - dispH * 0.5f;
+		}
+
+		const float gteOfsX = lastGteOfsX;
+		const float gteOfsY = lastGteOfsY;
 
 		v->ofsX = (ofsX + gteOfsX) / dispW * 2.0f;
 		v->ofsY = (ofsY + gteOfsY) / dispH * 2.0f;
@@ -209,7 +309,7 @@ inline void ApplyVertexPGXP(GrVertex* v, VERTTYPE* p, float ofsX, float ofsY, us
 #endif
 }
 
-void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, ushort gteidx)
+void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, uint gteidx)
 {
 	assert(p0);
 	assert(p1);
@@ -236,7 +336,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	ScreenCoordsToEmulator(vertex, 3);
 }
 
-void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, VERTTYPE* p3, ushort gteidx)
+void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, VERTTYPE* p3, uint gteidx)
 {
 	assert(p0);
 	assert(p1);
@@ -268,7 +368,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	ScreenCoordsToEmulator(vertex, 4);
 }
 
-void MakeVertexRect(GrVertex* vertex, VERTTYPE* p0, short w, short h, ushort gteidx)
+void MakeVertexRect(GrVertex* vertex, VERTTYPE* p0, short w, short h, uint gteidx)
 {
 	assert(p0);
 
@@ -304,6 +404,10 @@ void MakeTexcoordQuad(GrVertex* vertex, unsigned char* uv0, unsigned char* uv1, 
 	assert(uv3);
 
 	const unsigned char bright = 2;
+
+	// tpage bits 13-15 = game weather snow mode (draw.h SNOW_TPAGE_*), carried in bits 1-3 of dither
+	dither |= ((page >> 13) & 7) << 1;
+	page &= 0x1FFF;
 
 	vertex[0].u = uv0[0];
 	vertex[0].v = uv0[1];
@@ -356,6 +460,9 @@ void MakeTexcoordTriangle(GrVertex* vertex, unsigned char* uv0, unsigned char* u
 	assert(uv2);
 
 	const unsigned char bright = 2;
+
+	dither |= ((page >> 13) & 7) << 1;
+	page &= 0x1FFF;
 
 	vertex[0].u = uv0[0];
 	vertex[0].v = uv0[1];
@@ -716,6 +823,7 @@ static void AddSplit(bool semiTrans, bool textured)
 	split.drawenv = activeDrawEnv;
 	split.dispenv = activeDispEnv;
 	split.debugText = currentSplitDebugText;
+	split.sunShafts = 0;
 
 	split.drawenv.tw.w = overrideTextureWidth;
 	split.drawenv.tw.h = overrideTextureHeight;
@@ -729,7 +837,17 @@ void DrawSplit(const GPUDrawSplit& split)
 	if(split.debugText)
 		GR_PushDebugLabel(split.debugText);
 
+	if (split.sunShafts)
+	{
+		if (split.drawenv.dfe)
+			PsyX_PostFx_SunShafts(split.shaftAmount, split.shaftSun[0], split.shaftSun[1], split.shaftHorizonY, split.shaftColor);
+		return;
+	}
+
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
+
+	// blend mode first: the shader setup depends on it (fog is skipped for blended primitives)
+	GR_SetBlendMode(split.blendMode);
 
 	GR_SetTexture(split.textureId, split.texFormat);
 
@@ -739,8 +857,6 @@ void DrawSplit(const GPUDrawSplit& split)
 	const bool drawOnScreen = split.drawenv.dfe;
 	GR_SetupClipMode(&split.drawenv.clip, drawOnScreen);
 	GR_SetOffscreenState(&split.drawenv.clip, !drawOnScreen);
-
-	GR_SetBlendMode(split.blendMode);
 
 	GR_DrawTriangles(split.startVertex, split.numVerts / 3);
 
@@ -785,6 +901,9 @@ void DrawAllSplits()
 #endif // _DEBUG
 
 	// next code ideally should be called before EndScene
+	if (g_vertexIndex > g_vertexPeak)
+		g_vertexPeak = g_vertexIndex;
+
 	GR_UpdateVertexBuffer(g_vertexBuffer, g_vertexIndex);
 
 	for (int i = 1; i <= g_splitIndex; i++)
@@ -809,7 +928,7 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 		P_TAG* polyTag = reinterpret_cast<P_TAG*>(p);
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
 		// force PGXP off
-		polyTag->pgxp_index = 0xFFFF;
+		polyTag->pgxp_index = PGXP_INVALID_INDEX;
 #endif
 		ParsePrimitive(polyTag);
 
@@ -834,7 +953,10 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 				int primLength = 0;
 				while (currentPacket < endPacket)
 				{
+					const int firstVertex = g_vertexIndex;
+
 					primLength = ParsePrimitive(reinterpret_cast<P_TAG*>(currentPacket));
+					ApplyPrimFade(currentPacket, firstVertex);
 					currentPacket += (primLength + P_LEN) * sizeof(u_int);
 				}
 
@@ -866,7 +988,7 @@ inline int IsNull(POLY_FT3* poly)
 static int ProcessFlatLines(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1027,7 +1149,7 @@ static int ProcessFlatLines(P_TAG* polyTag)
 static int ProcessGouraudLines(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1081,7 +1203,7 @@ static int ProcessGouraudLines(P_TAG* polyTag)
 static int ProcessFlatPoly(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1180,7 +1302,7 @@ static int ProcessFlatPoly(P_TAG* polyTag)
 static int ProcessGouraudPoly(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1276,7 +1398,7 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
 static int ProcessTileAndSprt(P_TAG* polyTag)
 {
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-	const u_short gteIndex = polyTag->pgxp_index;
+	const uint gteIndex = polyTag->pgxp_index;
 #else
 	const u_short gteIndex = 0xFFFF;
 #endif
@@ -1522,6 +1644,40 @@ static int ProcessPsyXPrims(P_TAG* polyTag)
 		DR_PSYX_DBGMARKER* psydbg = (DR_PSYX_DBGMARKER*)polyTag;
 		currentSplitDebugText = psydbg->text;
 		return 2;
+	}
+	case 0x03:
+	{
+		// sun shafts get a split of their own so they run between the scene drawn so far and what follows
+		DR_PSYX_SUNSHAFTS* shafts = (DR_PSYX_SUNSHAFTS*)polyTag;
+		GPUDrawSplit& curSplit = g_splits[g_splitIndex];
+		curSplit.numVerts = g_vertexIndex - curSplit.startVertex;
+
+		if (g_splitIndex + 1 >= MAX_DRAW_SPLITS)
+			return 4;
+
+		float w, h;
+		DrawEnvDimensions(w, h);
+
+		GPUDrawSplit& split = g_splits[++g_splitIndex];
+		split.blendMode = BM_NONE;
+		split.texFormat = (TexFormat)0xFFFF;	// the next primitive always starts a new split
+		split.textureId = 0;
+		split.drawPrimMode = g_DrawPrimMode;
+		split.drawenv = activeDrawEnv;
+		split.dispenv = activeDispEnv;
+		split.debugText = nullptr;
+		split.startVertex = g_vertexIndex;
+		split.numVerts = 0;
+
+		split.sunShafts = 1;
+		split.shaftAmount = shafts->code[0] & 0xFF;
+		split.shaftSun[0] = (short)(shafts->code[1] & 0xFFFF) / w - 0.5f;
+		split.shaftSun[1] = (short)(shafts->code[1] >> 16) / h - 0.5f;
+		split.shaftHorizonY = (short)(shafts->code[3] & 0xFFFF) / h - 0.5f;
+		split.shaftColor[0] = (shafts->code[2] & 0xFF) / 255.0f;
+		split.shaftColor[1] = (shafts->code[2] >> 8 & 0xFF) / 255.0f;
+		split.shaftColor[2] = (shafts->code[2] >> 16 & 0xFF) / 255.0f;
+		return 4;
 	}
 	}
 

@@ -79,6 +79,40 @@ extern void PsyX_SetCursorPosition(int x, int y);
 /* Sets mouse relative movement */
 extern void PsyX_SetCursorRelative(int enable);
 
+/* Returns the mouse movement collected since the last call (only counted while relative mode is on) and clears it.
+   The return value is 1 when relative mode is on, else 0. */
+extern int PsyX_GetMouseDelta(int* dx, int* dy);
+
+/* Snow layer on the road: up-facing 3D surfaces near the road level. amount 0..1, groundPos = a point on the road level and
+   groundUp = unit vector pointing up, both in view space (GTE units) */
+extern void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp);
+
+/* Distance fog on 3D geometry: amount 0..1 (1 = about 8 cells of visibility, falls off with the square of the distance),
+   extinction = weather fog per GTE unit (exponential), color = rgb 0..1 */
+extern void PsyX_SetFog(float amount, float extinction, const float* color);
+
+/* Headlight cone of the player car, position and direction in view space (GTE units), amount 0..1 */
+extern void PsyX_SetBeam(float amount, const float* pos, const float* dir);
+
+/* Lamps that light the air (halos, also in front of walls): pos = count * 3 floats in view space like PsyX_SetBeam,
+   color = count * 4 floats (rgb 0..1, radius), dir = count * 3 floats (unit headlight direction that also lights
+   surfaces in front of it, 0 for a lamp), density 0 = off. amount = in-scattering of the headlight cone. */
+#define PSYX_MAX_VOLUME_LIGHTS 16
+extern void PsyX_SetVolumeLights(int count, const float* pos, const float* color, const float* dir, float density);
+extern void PsyX_SetVolumeBeam(float amount);
+/* Lamp highlights and light pools on ground tiles: 0 = off, 0.15 = dry road, 1 = wet road */
+extern void PsyX_SetRoadSpec(float amount);
+
+/* An object that fades in or out: the primitives written to [start, end) of the primitive buffer get fade 0..1 (1 =
+   opaque), drawn as an ordered dither. Holds for the next DrawOTag only; ranges must not overlap. */
+#define PSYX_MAX_PRIM_FADES 1024
+extern void PsyX_SetPrimFade(void* start, void* end, float fade);
+
+/* Height fog on top of the distance fog: optical depth heightDensity * exp(-heightFalloff * height) per unit, height above
+   sea level (camHeight for the camera). worldUpView and sunDirView are unit vectors in view space (GTE units, y down);
+   sunScatter 0..1 turns the fog towards sunColor when looking into the sun. heightDensity 0 = off. */
+extern void PsyX_SetAtmosphere(float heightFalloff, float heightDensity, const float* worldUpView, float camHeight, const float* sunDirView, const float* sunColor, float sunScatter);
+
 /* Usually called after ClearOTag/ClearOTagR */
 extern char PsyX_BeginScene(void);
 

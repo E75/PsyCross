@@ -76,6 +76,35 @@ int g_windowHeight = 0;
 int g_dbg_wireframeMode = 0;
 int g_dbg_texturelessMode = 0;
 
+// snow layer, see gpu_shader_snow
+static float g_snowAmount = 0.0f;
+static float g_snowGroundPos[3] = { 0, 0, 0 };		// a point on the road level, view space
+static float g_snowGroundUp[3] = { 0, -1, 0 };		// unit vector pointing up, view space
+static int g_snowSerial = 1;
+static float g_fogAmount = 0.0f;
+static float g_fogExtinction = 0.0f;
+static float g_fogColor[3] = { 0.7f, 0.7f, 0.7f };
+// headlight beam of the player car in view space, see beamLight in gpu_shader_snow
+static float g_beamAmount = 0.0f;
+static float g_beamPos[3] = { 0, 0, 0 };
+static float g_beamDir[3] = { 0, 0, 1 };
+// lamps and the headlight cone scattering in the air, see volumeLight in gpu_shader_snow
+static int g_volLightCount = 0;
+static float g_volLightPos[PSYX_MAX_VOLUME_LIGHTS * 3];
+static float g_volLightCol[PSYX_MAX_VOLUME_LIGHTS * 4];
+static float g_volLightDir[PSYX_MAX_VOLUME_LIGHTS * 3];
+static float g_volDensity = 0.0f;
+static float g_beamVolume = 0.0f;
+static float g_roadSpec = 0.0f;
+// height fog and sun glow of the fog, see applyFog in gpu_shader_snow
+static float g_hfFalloff = 0.0f;
+static float g_hfDensity = 0.0f;
+static float g_worldUp[3] = { 0, -1, 0 };
+static float g_camHeight = 0.0f;
+static float g_sunDir[3] = { 0, 0, 1 };
+static float g_sunColor[3] = { 1, 1, 1 };
+static float g_sunScatter = 0.0f;
+
 int g_cfg_pgxpTextureCorrection = 1;
 int g_cfg_pgxpZBuffer = 1;
 int g_cfg_bilinearFiltering = 0;
@@ -495,7 +524,33 @@ typedef struct
 	GLint texelSizeLoc;
 	GLint texLoc;
 	GLint lutLoc;
+	GLint snowLoc;
+	GLint snowGroundPosLoc;
+	GLint snowGroundUpLoc;
+	GLint fogLoc;
+	GLint fogColorLoc;
+	GLint fogFadeLoc;
+	GLint fogExtLoc;
+	GLint beamLoc;
+	GLint beamPosLoc;
+	GLint beamDirLoc;
+	GLint lightCountLoc;
+	GLint lightPosLoc;
+	GLint lightColLoc;
+	GLint lightDirLoc;
+	GLint volDensityLoc;
+	GLint beamVolumeLoc;
+	GLint roadSpecLoc;
+	GLint viewScaleLoc;
+	GLint hfFalloffLoc;
+	GLint hfDensityLoc;
+	GLint worldUpLoc;
+	GLint camHeightLoc;
+	GLint sunDirLoc;
+	GLint sunColorLoc;
+	GLint sunScatterLoc;
 #endif
+	int snowSerial;		// last g_snowSerial uploaded to this program
 } PSXGPU_Shader;
 
 PSXGPU_Shader g_gpu_shader_4;
@@ -566,7 +621,7 @@ GLint u_texelSizeLoc;
 		"		+3.0,  -1.0,  +2.0,  -2.0) / 255.0;\n"\
 		"	vec4 dither(vec4 color) {\n"\
 		"		ivec2 dc = ivec2(fract(gl_FragCoord.xy / 4.0) * 4.0);\n"\
-		"		color.xyz += vec3(c_dither[dc.x][dc.y] * v_texcoord.w);\n"\
+		"		color.xyz += vec3(c_dither[dc.x][dc.y] * mod(v_texcoord.w, 2.0));\n"\
 		"		return color;\n"\
 		"	}\n"
 
@@ -616,17 +671,313 @@ GLint u_texelSizeLoc;
 	"		return t;\n"\
 	"	}\n"\
 	"	uniform int bilinearFilter;\n"\
+	"	float snowEdge() {\n"\
+	"		if (abs(v_view.w - 6.0) > 0.5) { return 0.0; }\n"\
+	"		vec2 a = samplePSX(floor(v_texcoord.xy) - vec2(0.0, 1.0));\n"\
+	"		vec2 b = samplePSX(floor(v_texcoord.xy) - vec2(0.0, 3.0));\n"\
+	"		return (a.x + a.y == 0.0 || b.x + b.y == 0.0) ? 1.0 : 0.0;\n"\
+	"	}\n"\
 	"	void main() {\n"\
 	"		vec4 color = (bilinearFilter > 0) ? bilinearTextureSample(v_texcoord.xy) : nearestTextureSample(v_texcoord.xy);\n"\
-	"		fragColor = dither(color * v_color);\n"\
+	"		vec4 base = applySnow(color, snowEdge());\n"\
+	"		vec4 lit = base * vec4(v_color.rgb, 1.0);\n"\
+	"		lit.rgb += beamLight(base.rgb);\n"\
+	"		objectFade();\n"\
+	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n"
-	
+
 static const char* gpu_shader_common = R"(
 	varying vec4 v_texcoord;
 	varying vec4 v_color;
 	varying vec4 v_page_clut;
 	varying float v_z;
+	varying vec4 v_view;	// xy = view x, y / 128 / draw size - 0.5, z = view z / 128, w = 1 + snow mode for 3D (PGXP) geometry
 )";
+
+// A fading object (PsyX_SetPrimFade) carries its fade in the vertex alpha: an ordered 4x4 dither drops that share of its
+// pixels, so it needs no sorting and shows nothing through itself. Called last, after the screen space derivatives.
+static const char* gpu_shader_fade = R"(
+	float bayer2(vec2 a) { a = floor(a); return fract(a.x * 0.5 + a.y * a.y * 0.75); }
+
+	void objectFade() {
+		if (v_color.a < 0.999)
+		{
+			float t = bayer2(gl_FragCoord.xy * 0.5) * 0.25 + bayer2(gl_FragCoord.xy) + 0.5 / 16.0;
+
+			if (v_color.a < t)
+				discard;
+		}
+	}
+)";
+
+#if USE_PGXP && (defined(RENDERER_OGL) || (OGLES_VERSION == 3))
+// Weather snow on faces that point up (normal from screen space derivatives of the view space position). The snow mode
+// of the polygon (game tpage bits 13-15, draw.h SNOW_TPAGE_*) says where: ground tiles everywhere, other models only near
+// the road level under the camera (pavements), cars a light dusting, tree sprites on the top edges of their leaves.
+static const char* gpu_shader_snow = R"(
+	uniform float u_snow;
+	uniform vec3 u_groundPos;
+	uniform vec3 u_groundUp;
+	uniform vec2 u_viewScale;	// draw size * 128: v_view.xy hold view x, y / 128 / draw size - 0.5 (ScreenCoordsToEmulator)
+
+	// edge = 1 when the texel above this one is transparent (top of a leaf), see main
+	vec4 applySnow(vec4 color, float edge) {
+		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
+		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
+		float len = length(n);
+		float mode = v_view.w - 1.0;
+
+		if (u_snow <= 0.0 || v_view.w < 0.5 || abs(mode - 4.0) < 0.5 || len < 0.0001)	// mode 4: no snow at all
+			return color;
+
+		n /= len;
+		if (dot(n, p) > 0.0)
+			n = -n;		// face the camera
+
+		float up = dot(n, u_groundUp);
+		float lum = dot(color.rgb, vec3(0.3, 0.59, 0.11));
+		float snow;
+
+		if (abs(mode - 2.0) < 0.5)
+			snow = smoothstep(0.55, 0.75, up) * 0.92;	// ground tile: every road, also far away and up a hill
+		else if (abs(mode - 6.0) < 0.5)
+			snow = smoothstep(0.85, 0.97, up) * 0.45;	// car: roof, bonnet and boot only, the lamps stay clear
+		else if (abs(mode - 5.0) < 0.5)
+			snow = max(edge * 0.6, smoothstep(0.3, 0.6, lum) * 0.35);	// billboard sprite (tree): leaf tops and the sunlit leaves
+		else
+		{
+			// other models: horizontal faces within ~2 m of the road level, no roofs and no walls
+			float height = abs(dot(p - u_groundPos, u_groundUp));
+			snow = smoothstep(0.8, 0.95, up) * (1.0 - smoothstep(250.0, 400.0, height)) * 0.92;
+		}
+
+		// the texture shimmers through a little, so the road keeps its cracks and patches
+		color.rgb = mix(color.rgb, vec3(0.90, 0.92, 0.96) * (0.88 + 0.24 * lum), snow * u_snow);
+		return color;
+	}
+
+	// applied after the vertex lighting. Falls off with the square of the distance so the near street stays clear.
+	uniform float u_fog;
+	uniform vec3 u_fogColor;
+	uniform float u_fogExt;	// weather fog: extinction per unit, light fades exponentially along the ray (Beer-Lambert)
+	uniform float u_fogFade;	// added / subtracted primitives (glows, shadows): fog weakens them instead of tinting them
+
+	// Height fog density * exp(-falloff * height), integrated along the ray from the camera (height u_camHeight above
+	// sea level) to the pixel; the fog colour turns towards u_sunColor when looking into the sun (Henyey-Greenstein).
+	uniform float u_hfFalloff;
+	uniform float u_hfDensity;
+	uniform vec3 u_worldUp;		// view space, GTE units (y down)
+	uniform float u_camHeight;
+	uniform vec3 u_sunDir;
+	uniform vec3 u_sunColor;
+	uniform float u_sunScatter;
+
+	vec4 applyFog(vec4 color) {
+		float d = length(v_view.xyz) * 128.0;
+		float k = d * u_fog * 0.000108;
+		float f = v_view.w > 0.5 ? 1.0 - exp(-k * k - d * u_fogExt) : 0.0;
+		vec3 fogColor = u_fogColor;
+
+		if (u_hfDensity > 0.0 && v_view.w > 0.5)
+		{
+			vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
+			float t = length(p);
+
+			// the sky dome lies 256 times farther out (PGXP z scale of sky.c) and keeps its own colours
+			if (t > 1.0 && t < 400000.0)
+			{
+				float x = u_hfFalloff * dot(p, u_worldUp);	// falloff * height gained between camera and pixel
+				float shape = abs(x) > 0.001 ? (1.0 - exp(-x)) / x : 1.0 - 0.5 * x;
+				float tau = u_hfDensity * exp(-u_hfFalloff * u_camHeight) * t * shape;
+				f = 1.0 - (1.0 - f) * exp(-tau);
+
+				float g = 0.6;
+				float c = dot(p / t, u_sunDir);
+				float phase = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * c, 1.5) * (1.0 - g) * (1.0 - g) / (1.0 + g);	// 1 into the sun
+				fogColor = mix(fogColor, u_sunColor, clamp(u_sunScatter * phase, 0.0, 1.0));
+			}
+		}
+
+		if (u_fogFade > 0.0)
+			color.rgb *= 1.0 - f * u_fogFade;
+		else
+			color.rgb = mix(color.rgb, fogColor, f);
+		return color;
+	}
+
+	// lamps and headlights near the camera (view space), see volumeLight; u_volDensity is 0 for blended primitives
+	uniform int u_lightCount;
+	uniform vec3 u_lightPos[16];
+	uniform vec4 u_lightCol[16];	// rgb, w = radius
+	uniform vec3 u_lightDir[16];	// headlight direction, 0 for a lamp
+	uniform float u_volDensity;
+	uniform float u_beamVolume;
+	uniform float u_roadSpec;	// 0 = off, 0.15 dry .. 1 wet: lamp highlights and pools on ground tiles
+
+	// Headlights: the cone of the player car and the cones of the other cars, added on top of the vertex lighting.
+	uniform float u_beam;
+	uniform vec3 u_beamPos;
+	uniform vec3 u_beamDir;
+
+	// surf = the colour of the surface (the caller's base). The lamps keep it, the headlight cone gets at least half of
+	// white as its albedo, else a dark night texture (a wall, a black car) swallows the cone and stays unlit.
+	vec3 beamLight(vec3 surf) {
+		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
+		vec3 n = cross(dFdx(p), dFdy(p));	// must be outside of any branch
+		float len = length(n);
+
+		if ((u_beam <= 0.0 && u_volDensity <= 0.0) || v_view.w < 0.5 || len < 0.0001)
+			return vec3(0.0);
+
+		n /= len;
+		if (dot(n, p) > 0.0)
+			n = -n;
+
+		float dark = clamp(1.3 - dot(v_color.rgb, vec3(0.333)), 0.25, 1.0);	// less in daylight
+		vec3 sum = vec3(0.0);
+		vec3 gloss = vec3(0.0);	// highlights of the lamps on the road, not tinted by the road colour
+
+		// street lamps and traffic lights light everything; the world has part of their light baked in, so it gets less
+		// than cars and pedestrians (modes 6 and 4)
+		float mode = v_view.w - 1.0;
+		float lampLit = (abs(mode - 6.0) < 0.5 || abs(mode - 4.0) < 0.5) ? 1.0 : 0.4;
+		bool roadSpec = u_roadSpec > 0.0 && abs(mode - 2.0) < 0.5;	// ground tile: lamp pools and highlights
+		if (roadSpec)
+			lampLit = 1.6;
+		vec3 viewDir = -p / max(length(p), 1.0);
+		// other cars: two lamps each, shorter reach than the player's beam, so a car right in front of them is lit most
+		for (int i = 0; i < 16; i++)
+		{
+			if (i >= u_lightCount || u_volDensity <= 0.0)
+				break;
+
+			vec3 toLamp = u_lightPos[i] - p;
+			float lampDist = max(length(toLamp), 1.0);
+			vec3 ll = toLamp / lampDist;
+
+			if (dot(u_lightDir[i], u_lightDir[i]) < 0.25)
+			{
+				// a siren (dir of length 0.4) has nothing baked into the world: it lights the road and the walls around
+				// it in a wide circle, also at a grazing angle
+				float ground = clamp(length(u_lightDir[i]) * 2.5, 0.0, 1.0);
+				float reach = u_lightCol[i].w * (4.0 + ground * 1.5);	// w is the halo, 0.12 of the light radius
+				float a = clamp(1.0 - lampDist / reach, 0.0, 1.0);
+				float facing = max((dot(n, ll) + 0.2 + ground * 0.4) / (1.2 + ground * 0.4), 0.0);
+				float lit = mix(lampLit, lampLit > 0.5 ? 1.0 : 2.0, ground);
+				sum += u_lightCol[i].rgb * (a * a * facing * dark * lit * 0.7);
+
+				if (roadSpec)
+				{
+					// mirror streak: narrow across the view, long towards the camera (like a lamp mirrored in a wet road);
+					// the wetter the road, the narrower and brighter
+					vec3 h = normalize(ll + viewDir);
+					vec3 across = normalize(cross(n, viewDir));
+					float lat = dot(h, across);
+					float spec = pow(max(dot(n, h), 0.0), mix(2.0, 8.0, u_roadSpec)) * exp(-lat * lat * mix(120.0, 1200.0, u_roadSpec));
+					float specReach = clamp(1.0 - lampDist / (u_lightCol[i].w * 14.0), 0.0, 1.0);
+					gloss += u_lightCol[i].rgb * (spec * specReach * u_roadSpec * dark * 3.0);
+				}
+
+				continue;
+			}
+
+			float lampCone = smoothstep(0.6, 0.9, dot(-ll, normalize(u_lightDir[i])));
+			float lampAtten = clamp(1.0 - lampDist / 7000.0, 0.0, 1.0);
+			lampAtten *= lampAtten * smoothstep(20.0, 150.0, lampDist);	// a car right beside the lamp is lit too
+			float wrap = max((dot(n, ll) + 0.35) / 1.35, 0.0);	// a roof or side at a grazing angle still catches some
+			sum += vec3(1.0, 0.92, 0.75) * (lampCone * lampAtten * wrap * dark * 0.95);
+
+			if (roadSpec)
+			{
+				// a lamp mirrored in the road, whichever way its cone points: narrow across the view, long towards the camera
+				vec3 h = normalize(ll + viewDir);
+				float lat = dot(h, normalize(cross(n, viewDir)));
+				float spec = pow(max(dot(n, h), 0.0), mix(2.0, 8.0, u_roadSpec)) * exp(-lat * lat * mix(120.0, 1200.0, u_roadSpec));
+				float specReach = clamp(1.0 - lampDist / (u_lightCol[i].w * 14.0), 0.0, 1.0);
+				float highUp = smoothstep(150.0, 400.0, dot(toLamp, n));	// only lamps on a post: a car's headlights hang just above the road and made tall white spikes
+				gloss += vec3(1.0, 0.92, 0.75) * (highUp * spec * specReach * specReach * u_roadSpec * u_roadSpec * dark * 2.5);
+			}
+		}
+
+		if (u_beam <= 0.0)
+			return sum * surf + gloss;
+
+		vec3 toLight = u_beamPos - p;
+		float dist = max(length(toLight), 1.0);
+		vec3 l = toLight / dist;
+
+		float cone = smoothstep(0.80, 0.95, dot(-l, u_beamDir));
+		float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(150.0, 900.0, dist);	// no hot spot right at the nose
+		float ndl = mix(0.4, 1.0, max(dot(n, l), 0.0));
+
+		// the road is lit at a grazing angle (ndl near 0.4), hence the gain
+		return sum * surf + gloss + mix(surf, vec3(1.0), 0.5) * vec3(1.0, 0.92, 0.75) * (u_beam * cone * atten * ndl * dark * 1.5);
+	}
+
+	// Light scattered by the air between the camera and the pixel: point lights (closed form of the integral of
+	// 1 / (d^2 + k) along the ray) and the headlight cone (marched). Added after the fog, so it lies on top of it.
+
+	vec3 volumeLight() {
+		vec3 p = vec3((v_view.xy + 0.5) * u_viewScale, v_view.z * 128.0);
+		float t = length(p);
+
+		if (v_view.w < 0.5 || t < 1.0 || (u_volDensity <= 0.0 && u_beamVolume <= 0.0))
+			return vec3(0.0);
+
+		vec3 r = p / t;
+		vec3 sum = vec3(0.0);
+
+		for (int i = 0; i < 16; i++)
+		{
+			if (i >= u_lightCount)
+				break;
+
+			vec3 L = u_lightPos[i];
+			float radius = u_lightCol[i].w;	// halo radius
+			float k = radius * 0.15;		// core size: no infinite hot spot when the ray passes through the lamp
+			float b = dot(L, r);
+			float miss2 = max(dot(L, L) - b * b, 0.0);	// squared distance of the ray from the lamp
+			float h = sqrt(miss2 + k * k);
+			float scat = (atan((t - b) / h) - atan(-b / h)) * k / h;	// pi at the core
+			// soft edge (no visible disc), and no lamp whose halo holds the camera (it would tint the whole view)
+			float dist = length(L);
+			float reach = exp(-miss2 / (radius * radius)) * smoothstep(radius * 2.0, radius * 6.0, dist) * (1.0 - smoothstep(12000.0, 24000.0, dist));
+
+			sum += u_lightCol[i].rgb * (scat * reach);
+		}
+
+		sum *= u_volDensity * 0.05;
+
+		if (u_beamVolume > 0.0 && u_beam > 0.0)
+		{
+			float seg = min(t, 9000.0);
+			float beam = 0.0;
+
+			for (int j = 0; j < 8; j++)
+			{
+				vec3 s = r * (seg * (float(j) + 0.5) / 8.0);
+				vec3 toLight = u_beamPos - s;
+				float dist = max(length(toLight), 1.0);
+				float cone = smoothstep(0.80, 0.95, dot(-toLight / dist, u_beamDir));
+				float atten = clamp(1.0 - dist / 9000.0, 0.0, 1.0) * smoothstep(300.0, 2500.0, dist);
+				beam += cone * atten * atten;
+			}
+
+			// sum of the samples times the step length: a wall right in front of the car gets little haze
+			sum += vec3(1.0, 0.92, 0.75) * (beam * seg / (8.0 * 9000.0) * u_beam * u_beamVolume * 0.15);
+		}
+
+		return sum;
+	}
+)";
+#else
+static const char* gpu_shader_snow = R"(
+	vec4 applySnow(vec4 color, float edge) { return color; }
+	vec4 applyFog(vec4 color) { return color; }
+	vec3 beamLight(vec3 surf) { return vec3(0.0); }
+	vec3 volumeLight() { return vec3(0.0); }
+)";
+#endif
 
 const char* gpu_shader_4 = GPU_FRAGMENT_SAMPLE_SHADER(4);
 const char* gpu_shader_8 = GPU_FRAGMENT_SAMPLE_SHADER(8);
@@ -637,7 +988,11 @@ const char* gpu_shader_32_rgba =
 	"	void main() {\n"\
 	"		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"\
 	"		vec4 color = texture2D(s_texture, tc);\n"\
-	"		fragColor = dither(color * v_color);\n"\
+	"		vec4 base = applySnow(color, 0.0);\n"\
+	"		vec4 lit = base * vec4(v_color.rgb, 1.0);\n"\
+	"		lit.rgb += beamLight(base.rgb);\n"\
+	"		objectFade();\n"\
+	"		fragColor = dither(applyFog(lit) + vec4(volumeLight(), 0.0));\n"\
 	"	}\n";
 
 #if USE_PGXP
@@ -649,10 +1004,12 @@ const char* gpu_shader_32_rgba =
 		"		vec4(a_zw.z, -a_zw.w,  0.0,  1.0));\n"\
 		"	vec2 geom_ofs = vec2(0.5, 0.5);\n"\
 		"	vec4 fragPosition = (a_zw.y > 100.0 ? ofsMat * (Projection3D * vec4((a_position.xy + geom_ofs) * vec2(1.0,-1.0) * a_zw.y, a_zw.x, 1.0)) : (Projection * vec4(a_position.xy, 0.5, 1.0)));\n" \
-		"	gl_Position = fragPosition;\n"
+		"	gl_Position = fragPosition;\n"\
+		"	v_view = a_zw.y > 100.0 ? vec4(a_position.xy, a_zw.x, 1.0 + floor(a_texcoord.w * 0.5)) : vec4(0.0);\n"
 #else
 #	define GTE_PERSPECTIVE_CORRECTION \
-		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"
+		"	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"\
+		"	v_view = vec4(0.0);\n"
 #endif
 
 #define GTE_VERTEX_SHADER \
@@ -795,6 +1152,8 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 		extra_fs_defines,
 		gpu_shader_common,
 		GPU_DITHERING,
+		gpu_shader_snow,
+		gpu_shader_fade,
 		source
 	};
 
@@ -811,8 +1170,8 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 
 	const char** vs_list = isPsxShader ? vs_list_psx : vs_list_src;
 	const char** fs_list = isPsxShader ? fs_list_psx : fs_list_src;
-	const int vs_list_cnt = isPsxShader ? 4 : 3;
-	const int fs_list_cnt = isPsxShader ? 5 : 3;
+	const int vs_list_cnt = isPsxShader ? sizeof(vs_list_psx) / sizeof(vs_list_psx[0]) : sizeof(vs_list_src) / sizeof(vs_list_src[0]);
+	const int fs_list_cnt = isPsxShader ? sizeof(fs_list_psx) / sizeof(fs_list_psx[0]) : sizeof(fs_list_src) / sizeof(fs_list_src[0]);
 
 	GLuint program = glCreateProgram();
 
@@ -926,6 +1285,32 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->texelSizeLoc = glGetUniformLocation(sh->shader, "texelSize");
 	sh->texLoc = glGetUniformLocation(sh->shader, "s_texture");
 	sh->lutLoc = glGetUniformLocation(sh->shader, "s_rgLut");
+	sh->snowLoc = glGetUniformLocation(sh->shader, "u_snow");
+	sh->snowGroundPosLoc = glGetUniformLocation(sh->shader, "u_groundPos");
+	sh->snowGroundUpLoc = glGetUniformLocation(sh->shader, "u_groundUp");
+	sh->fogLoc = glGetUniformLocation(sh->shader, "u_fog");
+	sh->fogColorLoc = glGetUniformLocation(sh->shader, "u_fogColor");
+	sh->fogFadeLoc = glGetUniformLocation(sh->shader, "u_fogFade");
+	sh->fogExtLoc = glGetUniformLocation(sh->shader, "u_fogExt");
+	sh->beamLoc = glGetUniformLocation(sh->shader, "u_beam");
+	sh->beamPosLoc = glGetUniformLocation(sh->shader, "u_beamPos");
+	sh->beamDirLoc = glGetUniformLocation(sh->shader, "u_beamDir");
+	sh->lightCountLoc = glGetUniformLocation(sh->shader, "u_lightCount");
+	sh->lightPosLoc = glGetUniformLocation(sh->shader, "u_lightPos[0]");
+	sh->lightColLoc = glGetUniformLocation(sh->shader, "u_lightCol[0]");
+	sh->lightDirLoc = glGetUniformLocation(sh->shader, "u_lightDir[0]");
+	sh->volDensityLoc = glGetUniformLocation(sh->shader, "u_volDensity");
+	sh->beamVolumeLoc = glGetUniformLocation(sh->shader, "u_beamVolume");
+	sh->roadSpecLoc = glGetUniformLocation(sh->shader, "u_roadSpec");
+	sh->viewScaleLoc = glGetUniformLocation(sh->shader, "u_viewScale");
+	sh->hfFalloffLoc = glGetUniformLocation(sh->shader, "u_hfFalloff");
+	sh->hfDensityLoc = glGetUniformLocation(sh->shader, "u_hfDensity");
+	sh->worldUpLoc = glGetUniformLocation(sh->shader, "u_worldUp");
+	sh->camHeightLoc = glGetUniformLocation(sh->shader, "u_camHeight");
+	sh->sunDirLoc = glGetUniformLocation(sh->shader, "u_sunDir");
+	sh->sunColorLoc = glGetUniformLocation(sh->shader, "u_sunColor");
+	sh->sunScatterLoc = glGetUniformLocation(sh->shader, "u_sunScatter");
+	sh->snowSerial = 0;
 #if USE_PGXP
 	sh->projection3DLoc = glGetUniformLocation(sh->shader, "Projection3D");
 #endif
@@ -1234,6 +1619,143 @@ void GR_SetShader(const ShaderID shader)
 }
 
 
+void PsyX_SetSnow(float amount, const float* groundPos, const float* groundUp)
+{
+	g_snowAmount = amount;
+	memcpy(g_snowGroundPos, groundPos, sizeof(g_snowGroundPos));
+	memcpy(g_snowGroundUp, groundUp, sizeof(g_snowGroundUp));
+	g_snowSerial++;
+}
+
+void PsyX_SetFog(float amount, float extinction, const float* color)
+{
+	g_fogAmount = amount;
+	g_fogExtinction = extinction;
+	memcpy(g_fogColor, color, sizeof(g_fogColor));
+	g_snowSerial++;
+}
+
+void PsyX_SetBeam(float amount, const float* pos, const float* dir)
+{
+	g_beamAmount = amount;
+	memcpy(g_beamPos, pos, sizeof(g_beamPos));
+	memcpy(g_beamDir, dir, sizeof(g_beamDir));
+	g_snowSerial++;
+}
+
+void PsyX_SetVolumeLights(int count, const float* pos, const float* color, const float* dir, float density)
+{
+	if (count > PSYX_MAX_VOLUME_LIGHTS)
+		count = PSYX_MAX_VOLUME_LIGHTS;
+
+	g_volLightCount = count > 0 ? count : 0;
+	memcpy(g_volLightPos, pos, sizeof(float) * 3 * g_volLightCount);
+	memcpy(g_volLightCol, color, sizeof(float) * 4 * g_volLightCount);
+	memcpy(g_volLightDir, dir, sizeof(float) * 3 * g_volLightCount);
+	g_volDensity = g_volLightCount > 0 ? density : 0.0f;
+	g_snowSerial++;
+}
+
+void PsyX_SetVolumeBeam(float amount)
+{
+	g_beamVolume = amount;
+}
+
+void PsyX_SetRoadSpec(float amount)
+{
+	g_roadSpec = amount;
+}
+
+void PsyX_SetAtmosphere(float heightFalloff, float heightDensity, const float* worldUpView, float camHeight, const float* sunDirView, const float* sunColor, float sunScatter)
+{
+	g_hfFalloff = heightFalloff;
+	g_hfDensity = heightDensity;
+	memcpy(g_worldUp, worldUpView, sizeof(g_worldUp));
+	g_camHeight = camHeight;
+	memcpy(g_sunDir, sunDirView, sizeof(g_sunDir));
+	memcpy(g_sunColor, sunColor, sizeof(g_sunColor));
+	g_sunScatter = sunScatter;
+	g_snowSerial++;
+}
+
+// uniforms belong to a program, so every program has to get the current weather state once after it changed
+static void GR_UploadSnow(PSXGPU_Shader* sh)
+{
+#if USE_OPENGL
+	// glows and shadows are blended, the beam only lights opaque geometry
+	if (sh->beamLoc != -1)
+		glUniform1f(sh->beamLoc, g_PreviousBlendMode == BM_NONE ? g_beamAmount : 0.0f);
+
+	// blended primitives get fog too (an unfogged shadow stayed dark on fogged ground): glows and shadows fade with it,
+	// a glow less, as a light shines farther through fog
+	if (sh->fogLoc != -1)
+		glUniform1f(sh->fogLoc, g_fogAmount);
+
+	if (sh->fogFadeLoc != -1)
+		glUniform1f(sh->fogFadeLoc, g_PreviousBlendMode == BM_SUBTRACT ? 1.0f : (g_PreviousBlendMode == BM_ADD || g_PreviousBlendMode == BM_ADD_QUATER_SOURCE) ? 0.6f : 0.0f);
+
+	if (sh->hfDensityLoc != -1)
+		glUniform1f(sh->hfDensityLoc, g_hfDensity);
+
+	// same for snow: car light reflections and shadows lie flat on the road and would turn into white squares
+	if (sh->snowLoc != -1)
+		glUniform1f(sh->snowLoc, g_PreviousBlendMode == BM_NONE ? g_snowAmount : 0.0f);
+
+	// the air in front of a glow sprite or a shadow is already lit by the opaque geometry behind it
+	if (sh->volDensityLoc != -1)
+	{
+		glUniform1f(sh->volDensityLoc, g_PreviousBlendMode == BM_NONE ? g_volDensity : 0.0f);
+		glUniform1f(sh->beamVolumeLoc, g_PreviousBlendMode == BM_NONE ? g_beamVolume : 0.0f);
+		glUniform1f(sh->roadSpecLoc, g_PreviousBlendMode == BM_NONE ? g_roadSpec : 0.0f);
+
+		if (activeDrawEnv.dfe)
+			glUniform2f(sh->viewScaleLoc, activeDispEnv.disp.w * 128.0f, activeDispEnv.disp.h * 128.0f);
+		else
+			glUniform2f(sh->viewScaleLoc, activeDrawEnv.clip.w * 128.0f, activeDrawEnv.clip.h * 128.0f);
+	}
+
+	if (sh->snowSerial == g_snowSerial)
+		return;
+
+	sh->snowSerial = g_snowSerial;
+
+	if (sh->snowLoc == -1)
+		return;
+
+	glUniform3fv(sh->snowGroundPosLoc, 1, g_snowGroundPos);
+	glUniform3fv(sh->snowGroundUpLoc, 1, g_snowGroundUp);
+	glUniform3fv(sh->fogColorLoc, 1, g_fogColor);
+	glUniform1f(sh->fogExtLoc, g_fogExtinction);
+
+	if (sh->hfFalloffLoc != -1)
+	{
+		glUniform1f(sh->hfFalloffLoc, g_hfFalloff);
+		glUniform3fv(sh->worldUpLoc, 1, g_worldUp);
+		glUniform1f(sh->camHeightLoc, g_camHeight);
+		glUniform3fv(sh->sunDirLoc, 1, g_sunDir);
+		glUniform3fv(sh->sunColorLoc, 1, g_sunColor);
+		glUniform1f(sh->sunScatterLoc, g_sunScatter);
+	}
+
+	if (sh->beamPosLoc != -1)
+	{
+		glUniform3fv(sh->beamPosLoc, 1, g_beamPos);
+		glUniform3fv(sh->beamDirLoc, 1, g_beamDir);
+	}
+
+	if (sh->lightCountLoc != -1)
+	{
+		glUniform1i(sh->lightCountLoc, g_volLightCount);
+
+		if (g_volLightCount > 0)
+		{
+			glUniform3fv(sh->lightPosLoc, g_volLightCount, g_volLightPos);
+			glUniform4fv(sh->lightColLoc, g_volLightCount, g_volLightCol);
+			glUniform3fv(sh->lightDirLoc, g_volLightCount, g_volLightDir);
+		}	}
+#endif
+}
+
 void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
 	GLint texLoc = 0;
@@ -1243,6 +1765,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 	{
 	case TF_4_BIT:
 		GR_SetShader(g_gpu_shader_4.shader);
+		GR_UploadSnow(&g_gpu_shader_4);
 		bilinearFilterLoc = g_gpu_shader_4.bilinearFilterLoc;
 		u_projectionLoc = g_gpu_shader_4.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_4.projection3DLoc;
@@ -1252,6 +1775,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		break;
 	case TF_8_BIT:
 		GR_SetShader(g_gpu_shader_8.shader);
+		GR_UploadSnow(&g_gpu_shader_8);
 		bilinearFilterLoc = g_gpu_shader_8.bilinearFilterLoc;
 		u_projectionLoc = g_gpu_shader_8.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_8.projection3DLoc;
@@ -1261,6 +1785,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		break;
 	case TF_16_BIT:
 		GR_SetShader(g_gpu_shader_16.shader);
+		GR_UploadSnow(&g_gpu_shader_16);
 		bilinearFilterLoc = g_gpu_shader_16.bilinearFilterLoc;
 		u_projectionLoc = g_gpu_shader_16.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_16.projection3DLoc;
@@ -1270,6 +1795,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		break;
 	case TF_32_BIT_RGBA:
 		GR_SetShader(g_gpu_shader_32_rgba.shader);
+		GR_UploadSnow(&g_gpu_shader_32_rgba);
 		bilinearFilterLoc = -1;
 		u_projectionLoc = g_gpu_shader_32_rgba.projectionLoc;
 		u_projection3DLoc = g_gpu_shader_32_rgba.projection3DLoc;

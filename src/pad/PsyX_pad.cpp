@@ -19,6 +19,7 @@ typedef struct
 
 	u_char*				padData;
 	bool				switchingAnalog;
+	bool				analogDefaulted;	// the sticks are on from the start, Select + Start still switches them off
 } PsyXController;
 
 int						g_cfg_controllerToSlotMapping[MAX_CONTROLLERS] = { -1, -1 };
@@ -99,6 +100,7 @@ void PsyX_Pad_OpenController(Sint32 deviceId, int slot)
 
 	controller->gc = SDL_GameControllerOpen(deviceId);
 	controller->switchingAnalog = false;
+	controller->analogDefaulted = false;
 
 	if (controller->gc)
 	{
@@ -209,6 +211,12 @@ void PsyX_Pad_InternalPadUpdates()
 			pad = (LPPADRAW)controller->padData;
 
 			PsyX_Pad_UpdateGameControllerInput(controller->gc, pad);
+
+			if (controller->gc && !controller->analogDefaulted)
+			{
+				pad->id = 0x73;
+				controller->analogDefaulted = true;
+			}
 
 			ushort test = *(u_short*)pad->buttons;
 

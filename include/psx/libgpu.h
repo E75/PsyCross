@@ -205,7 +205,7 @@ extern	int (*GPU_printf)(const char *fmt, ...);
 #define getcode(p)   		(u_char)(((P_TAG *)(p))->code)
 
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-#define setpgxpindex(p, i)	(((P_TAG *)(p))->pgxp_index = (u_short)(i))
+#define setpgxpindex(p, i)	(((P_TAG *)(p))->pgxp_index = (u_int)(i))
 #define addPrim(ot, p)		setaddr(p, getaddr(ot)), setaddr(ot, p), setpgxpindex(p, PGXP_GetIndex(1))
 #else
 #define addPrim(ot, p)		setaddr(p, getaddr(ot)), setaddr(ot, p)
@@ -333,8 +333,8 @@ typedef struct _RECT16 {
 
 #define DECLARE_P_ADDR \
 		uintptr_t addr; \
-		uint len : 16; \
-		uint pgxp_index : 16;
+		uint len : 8; \
+		uint pgxp_index : 24;
 
 #define P_LEN		3		// 3 longs
 
@@ -342,8 +342,8 @@ typedef struct _RECT16 {
 
 #define DECLARE_P_ADDR \
 		uintptr_t addr; \
-		uint len : 16; \
-		uint pgxp_index : 16;
+		uint len : 8; \
+		uint pgxp_index : 24;
 
 #define P_LEN		2		// 2 longs
 
@@ -702,6 +702,14 @@ typedef struct {
 	const char* text;
 } DR_PSYX_DBGMARKER;
 
+// screen space god rays from the sun, drawn over everything already in the frame
+typedef struct {
+	DECLARE_P_ADDR
+	u_int  code[4];
+} DR_PSYX_SUNSHAFTS;
+
+static_assert(sizeof(DR_PSYX_SUNSHAFTS) / 4 - P_LEN == 4, "DR_PSYX_SUNSHAFTS size must be 4 longs");
+
 /*
  * Environment
  */
@@ -911,6 +919,7 @@ extern void GetDrawEnv2(DR_ENV *p);
 
 extern void SetPsyXTexture(DR_PSYX_TEX *p, uint grTextureId, int width, int height);
 extern void SetPsyXDebugMarker(DR_PSYX_DBGMARKER* p, const char* str);
+extern void SetPsyXSunShafts(DR_PSYX_SUNSHAFTS* p, int amount, int sunX, int sunY, int horizonY, int r, int g, int b);
 
 #ifdef _DEBUG
 #define PSYX_DBG_MARKER_TEXT(primptr, ot, text) \
